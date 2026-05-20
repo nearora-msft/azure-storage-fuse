@@ -30,6 +30,15 @@ const maxParallelChunkOps = 8
 // flushing pending chunks at commit time.
 const maxPendingL2Uploads = 8
 
+// pendingWriteTTL is the maximum time pending chunks are held before being
+// evicted. This handles abandoned writes (e.g., process crash before commit,
+// lazy-write with long-lived handles).
+const pendingWriteTTL = 5 * time.Minute
+
+// pendingCleanupInterval is how often the background goroutine scans for
+// expired pending entries.
+const pendingCleanupInterval = 30 * time.Second
+
 // DistCacheOptions holds configuration for the distributed cache component.
 type DistCacheOptions struct {
 	// Discovery (preferred — auto-detects servers)
@@ -66,6 +75,14 @@ type pendingChunk struct {
 	data   []byte
 }
 
+// pendingFile tracks buffered chunks for a single file along with metadata
+// for size-cap and TTL-based eviction.
+type pendingFile struct {
+	chunks       []pendingChunk
+	totalSize    int64     // sum of len(chunk.data) for all chunks
+	lastActivity time.Time // updated on each StageData; used for TTL eviction
+}
+
 // DistCache is the blobfuse component that sits between the local cache and azstorage,
 // providing a shared distributed cache layer across nodes.
 type DistCache struct {
@@ -87,7 +104,10 @@ type DistCache struct {
 	// StageData and flushed to L2 only after CommitData succeeds, preventing
 	// other nodes from reading partially-written data.
 	pendingMu     sync.Mutex
-	pendingWrites map[string][]pendingChunk
+	pendingWrites map[string]*pendingFile
+
+	// stopCleanup signals the background pending-writes cleanup goroutine to exit.
+	stopCleanup chan struct{}
 }
 
 const dirtyTTL = 10 * time.Second
@@ -111,7 +131,8 @@ var _ internal.Component = &DistCache{}
 func NewDistCacheComponent() internal.Component {
 	comp := &DistCache{
 		dirtyFiles:    make(map[string]time.Time),
-		pendingWrites: make(map[string][]pendingChunk),
+		pendingWrites: make(map[string]*pendingFile),
+		stopCleanup:   make(chan struct{}),
 	}
 	comp.SetName(compName)
 	return comp
@@ -226,11 +247,16 @@ func (dc *DistCache) Start(ctx context.Context) error {
 
 	dc.client = client
 	log.Info("DistCache::Start : connected to distributed cache cluster")
+
+	// Start background goroutine to evict stale pending writes
+	go dc.pendingCleanupLoop()
+
 	return nil
 }
 
 func (dc *DistCache) Stop() error {
 	log.Trace("Stopping component : %s", dc.Name())
+	close(dc.stopCleanup)
 	if dc.client != nil {
 		return dc.client.Close()
 	}
@@ -439,16 +465,37 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 		return nil
 	}
 
-	// Buffer the chunk for deferred L2 population at commit time.
-	// This prevents other nodes from seeing partially-written data in L2.
-	dataCopy := make([]byte, len(options.Data))
-	copy(dataCopy, options.Data)
+	dataLen := int64(len(options.Data))
+	maxSize := int64(dc.conf.MaxFileSizeMB) * 1024 * 1024
 
 	dc.pendingMu.Lock()
-	dc.pendingWrites[options.Name] = append(dc.pendingWrites[options.Name], pendingChunk{
+	pf := dc.pendingWrites[options.Name]
+
+	// Size cap: if buffering this chunk would exceed MaxFileSizeMB, drop all
+	// pending data for this file. L2 will be warmed via the read path instead.
+	if maxSize > 0 && pf != nil && pf.totalSize+dataLen > maxSize {
+		log.Debug("DistCache::StageData : pending size would exceed %dMB for %s, skipping L2 write-warming",
+			dc.conf.MaxFileSizeMB, options.Name)
+		delete(dc.pendingWrites, options.Name)
+		dc.pendingMu.Unlock()
+		dc.markDirty(options.Name)
+		return nil
+	}
+
+	// Buffer the chunk for deferred L2 population at commit time.
+	dataCopy := make([]byte, dataLen)
+	copy(dataCopy, options.Data)
+
+	if pf == nil {
+		pf = &pendingFile{}
+		dc.pendingWrites[options.Name] = pf
+	}
+	pf.chunks = append(pf.chunks, pendingChunk{
 		offset: int64(options.Offset),
 		data:   dataCopy,
 	})
+	pf.totalSize += dataLen
+	pf.lastActivity = time.Now()
 	dc.pendingMu.Unlock()
 
 	// Mark dirty so local reads also bypass L2 during the write window
@@ -470,12 +517,12 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	// Drain pending chunks and flush to L2 asynchronously now that the
 	// file is committed in Azure and safe for other nodes to read.
 	dc.pendingMu.Lock()
-	chunks := dc.pendingWrites[options.Name]
+	pf := dc.pendingWrites[options.Name]
 	delete(dc.pendingWrites, options.Name)
 	dc.pendingMu.Unlock()
 
-	if len(chunks) > 0 {
-		go dc.flushPendingToL2(options.Name, chunks)
+	if pf != nil && len(pf.chunks) > 0 {
+		go dc.flushPendingToL2(options.Name, pf.chunks)
 	}
 	return nil
 }
@@ -666,6 +713,36 @@ func (dc *DistCache) flushPendingToL2(name string, chunks []pendingChunk) {
 
 	_ = g.Wait()
 	log.Debug("DistCache::flushPendingToL2 : flushed %d chunks for %s", len(chunks), name)
+}
+
+// pendingCleanupLoop periodically evicts pending entries that have exceeded
+// pendingWriteTTL. This handles abandoned writes where CommitData is never called.
+func (dc *DistCache) pendingCleanupLoop() {
+	ticker := time.NewTicker(pendingCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-dc.stopCleanup:
+			return
+		case <-ticker.C:
+			dc.evictStalePending()
+		}
+	}
+}
+
+// evictStalePending removes pending entries whose lastActivity exceeds pendingWriteTTL.
+func (dc *DistCache) evictStalePending() {
+	now := time.Now()
+	dc.pendingMu.Lock()
+	for name, pf := range dc.pendingWrites {
+		if now.Sub(pf.lastActivity) > pendingWriteTTL {
+			log.Debug("DistCache::evictStalePending : evicting %d stale chunks for %s (idle %v)",
+				len(pf.chunks), name, now.Sub(pf.lastActivity))
+			delete(dc.pendingWrites, name)
+		}
+	}
+	dc.pendingMu.Unlock()
 }
 
 func (dc *DistCache) populateCache(name string, filePath string) {

@@ -173,7 +173,8 @@ func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCach
 		chunkSize:     16 * 1024 * 1024,
 		bypassOnError: true,
 		dirtyFiles:    make(map[string]time.Time),
-		pendingWrites: make(map[string][]pendingChunk),
+		pendingWrites: make(map[string]*pendingFile),
+		stopCleanup:   make(chan struct{}),
 	}
 	dc.SetName(compName)
 	dc.SetNextComponent(next)
@@ -488,14 +489,16 @@ func TestStageData_BuffersPendingChunks(t *testing.T) {
 
 	// Verify chunks are buffered in pendingWrites
 	dc.pendingMu.Lock()
-	chunks := dc.pendingWrites["test/file.bin"]
+	pf := dc.pendingWrites["test/file.bin"]
 	dc.pendingMu.Unlock()
 
-	assert.Equal(t, 2, len(chunks), "should buffer both chunks")
-	assert.Equal(t, int64(0), chunks[0].offset)
-	assert.Equal(t, []byte("chunk-0-data"), chunks[0].data)
-	assert.Equal(t, int64(1024), chunks[1].offset)
-	assert.Equal(t, []byte("chunk-1-data"), chunks[1].data)
+	require.NotNil(t, pf, "should have a pendingFile entry")
+	assert.Equal(t, 2, len(pf.chunks), "should buffer both chunks")
+	assert.Equal(t, int64(0), pf.chunks[0].offset)
+	assert.Equal(t, []byte("chunk-0-data"), pf.chunks[0].data)
+	assert.Equal(t, int64(1024), pf.chunks[1].offset)
+	assert.Equal(t, []byte("chunk-1-data"), pf.chunks[1].data)
+	assert.Equal(t, int64(24), pf.totalSize, "totalSize should track cumulative data")
 
 	// Verify no L2 upload happened yet
 	assert.Equal(t, 0, mock.uploadChunkCalled, "should not upload to L2 during stage")
@@ -514,6 +517,68 @@ func TestStageData_MarksDirty(t *testing.T) {
 	})
 
 	assert.True(t, dc.isDirty("test/file.bin"), "file should be marked dirty during write")
+}
+
+func TestStageData_SizeCapEvictsPending(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+	dc.conf.MaxFileSizeMB = 1 // 1MB cap
+
+	// Stage a chunk that's under the cap
+	chunk := make([]byte, 512*1024) // 512KB
+	err := dc.StageData(internal.StageDataOptions{
+		Name: "test/big.bin", Offset: 0, Data: chunk, Id: "b0",
+	})
+	assert.NoError(t, err)
+
+	dc.pendingMu.Lock()
+	assert.NotNil(t, dc.pendingWrites["test/big.bin"], "should buffer chunk under cap")
+	dc.pendingMu.Unlock()
+
+	// Stage another chunk that pushes it over the 1MB cap
+	chunk2 := make([]byte, 512*1024+1) // 512KB + 1 byte, total exceeds 1MB
+	err = dc.StageData(internal.StageDataOptions{
+		Name: "test/big.bin", Offset: 512 * 1024, Data: chunk2, Id: "b1",
+	})
+	assert.NoError(t, err)
+
+	// Pending should be evicted (over cap)
+	dc.pendingMu.Lock()
+	_, exists := dc.pendingWrites["test/big.bin"]
+	dc.pendingMu.Unlock()
+	assert.False(t, exists, "should evict pending when size cap exceeded")
+}
+
+func TestEvictStalePending(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Manually insert a stale pending entry
+	dc.pendingMu.Lock()
+	dc.pendingWrites["stale/file.bin"] = &pendingFile{
+		chunks:       []pendingChunk{{offset: 0, data: []byte("old")}},
+		totalSize:    3,
+		lastActivity: time.Now().Add(-10 * time.Minute), // well past TTL
+	}
+	dc.pendingWrites["fresh/file.bin"] = &pendingFile{
+		chunks:       []pendingChunk{{offset: 0, data: []byte("new")}},
+		totalSize:    3,
+		lastActivity: time.Now(), // fresh
+	}
+	dc.pendingMu.Unlock()
+
+	// Run eviction
+	dc.evictStalePending()
+
+	dc.pendingMu.Lock()
+	_, staleExists := dc.pendingWrites["stale/file.bin"]
+	_, freshExists := dc.pendingWrites["fresh/file.bin"]
+	dc.pendingMu.Unlock()
+
+	assert.False(t, staleExists, "stale entry should be evicted")
+	assert.True(t, freshExists, "fresh entry should remain")
 }
 
 func TestCommitData_ForwardOnly(t *testing.T) {
@@ -545,7 +610,9 @@ func TestCommitData_FlushesPendingToL2(t *testing.T) {
 
 	// Verify chunks are pending
 	dc.pendingMu.Lock()
-	assert.Equal(t, 2, len(dc.pendingWrites["test/file.bin"]))
+	pf := dc.pendingWrites["test/file.bin"]
+	require.NotNil(t, pf)
+	assert.Equal(t, 2, len(pf.chunks))
 	dc.pendingMu.Unlock()
 
 	// Commit
