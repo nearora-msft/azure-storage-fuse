@@ -24,6 +24,7 @@ type mockDCacheClient struct {
 	store             map[string][]byte
 	downloadPartialFn func(ctx context.Context, filename string, fileSize int64, w io.WriterAt, opts ...dcache.DownloadOption) ([]dcache.ChunkError, error)
 	chunkFn           func(ctx context.Context, filename string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
+	uploadChunkCalled int
 }
 
 func newMockDCacheClient() *mockDCacheClient {
@@ -65,6 +66,7 @@ func (m *mockDCacheClient) DownloadChunk(ctx context.Context, filename string, o
 }
 
 func (m *mockDCacheClient) UploadChunk(_ context.Context, filename string, offset int64, data []byte, _ ...dcache.UploadOption) error {
+	m.uploadChunkCalled++
 	key := fmt.Sprintf("%s:%d", filename, offset)
 	m.store[key] = append([]byte(nil), data...)
 	return nil
@@ -171,6 +173,7 @@ func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCach
 		chunkSize:     16 * 1024 * 1024,
 		bypassOnError: true,
 		dirtyFiles:    make(map[string]time.Time),
+		pendingWrites: make(map[string][]pendingChunk),
 	}
 	dc.SetName(compName)
 	dc.SetNextComponent(next)
@@ -461,6 +464,58 @@ func TestStageData_WriteThrough(t *testing.T) {
 	assert.Equal(t, 1, next.stageDataCalled, "should forward to azstorage")
 }
 
+func TestStageData_BuffersPendingChunks(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Stage two chunks for the same file
+	err := dc.StageData(internal.StageDataOptions{
+		Name:   "test/file.bin",
+		Offset: 0,
+		Data:   []byte("chunk-0-data"),
+		Id:     "block-0",
+	})
+	assert.NoError(t, err)
+
+	err = dc.StageData(internal.StageDataOptions{
+		Name:   "test/file.bin",
+		Offset: 1024,
+		Data:   []byte("chunk-1-data"),
+		Id:     "block-1",
+	})
+	assert.NoError(t, err)
+
+	// Verify chunks are buffered in pendingWrites
+	dc.pendingMu.Lock()
+	chunks := dc.pendingWrites["test/file.bin"]
+	dc.pendingMu.Unlock()
+
+	assert.Equal(t, 2, len(chunks), "should buffer both chunks")
+	assert.Equal(t, int64(0), chunks[0].offset)
+	assert.Equal(t, []byte("chunk-0-data"), chunks[0].data)
+	assert.Equal(t, int64(1024), chunks[1].offset)
+	assert.Equal(t, []byte("chunk-1-data"), chunks[1].data)
+
+	// Verify no L2 upload happened yet
+	assert.Equal(t, 0, mock.uploadChunkCalled, "should not upload to L2 during stage")
+}
+
+func TestStageData_MarksDirty(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	_ = dc.StageData(internal.StageDataOptions{
+		Name:   "test/file.bin",
+		Offset: 0,
+		Data:   []byte("data"),
+		Id:     "block-0",
+	})
+
+	assert.True(t, dc.isDirty("test/file.bin"), "file should be marked dirty during write")
+}
+
 func TestCommitData_ForwardOnly(t *testing.T) {
 	mock := newMockDCacheClient()
 	next := &mockNextComponent{}
@@ -473,6 +528,46 @@ func TestCommitData_ForwardOnly(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, 1, next.commitDataCalled)
+}
+
+func TestCommitData_FlushesPendingToL2(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Stage chunks first
+	_ = dc.StageData(internal.StageDataOptions{
+		Name: "test/file.bin", Offset: 0, Data: []byte("chunk-0"), Id: "b0",
+	})
+	_ = dc.StageData(internal.StageDataOptions{
+		Name: "test/file.bin", Offset: 4096, Data: []byte("chunk-1"), Id: "b1",
+	})
+
+	// Verify chunks are pending
+	dc.pendingMu.Lock()
+	assert.Equal(t, 2, len(dc.pendingWrites["test/file.bin"]))
+	dc.pendingMu.Unlock()
+
+	// Commit
+	err := dc.CommitData(internal.CommitDataOptions{
+		Name: "test/file.bin",
+		List: []string{"b0", "b1"},
+	})
+	assert.NoError(t, err)
+
+	// pendingWrites should be drained immediately
+	dc.pendingMu.Lock()
+	_, exists := dc.pendingWrites["test/file.bin"]
+	dc.pendingMu.Unlock()
+	assert.False(t, exists, "pending chunks should be drained after commit")
+
+	// Wait briefly for the async flush goroutine to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify chunks were uploaded to L2
+	assert.Equal(t, 2, mock.uploadChunkCalled, "should flush both chunks to L2")
+	assert.Equal(t, []byte("chunk-0"), mock.store["test/file.bin:0"])
+	assert.Equal(t, []byte("chunk-1"), mock.store["test/file.bin:4096"])
 }
 
 func TestDeleteFile_Invalidation(t *testing.T) {
