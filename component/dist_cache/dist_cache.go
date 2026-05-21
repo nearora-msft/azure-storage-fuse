@@ -345,6 +345,15 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 		return nil
 	}
 
+	// Mark dirty so other nodes bypass stale L2 data during the populate window
+	dc.markDirty(options.Name)
+
+	// Invalidate old L2 entry to prevent serving stale chunks (e.g. if the
+	// new file is smaller, leftover chunks from the old version would remain)
+	if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+		log.Warn("DistCache::CopyFromFile : L2 invalidation failed for %s: %v", options.Name, err)
+	}
+
 	// Populate distributed cache (best-effort, async)
 	go dc.populateCache(options.Name, options.File.Name())
 	return nil
@@ -645,10 +654,18 @@ func (dc *DistCache) pollChunkIntoBuffer(ctx context.Context, name string, offse
 }
 
 // markDirty records that a file was recently invalidated. Reads for this file
-// will bypass dist_cache until dirtyTTL expires.
+// will bypass dist_cache until dirtyTTL expires or clearDirty is called.
 func (dc *DistCache) markDirty(name string) {
 	dc.dirtyMu.Lock()
 	dc.dirtyFiles[name] = time.Now()
+	dc.dirtyMu.Unlock()
+}
+
+// clearDirty removes the dirty flag for a file, allowing reads to use L2 again.
+// Called after L2 has been successfully re-populated with fresh data.
+func (dc *DistCache) clearDirty(name string) {
+	dc.dirtyMu.Lock()
+	delete(dc.dirtyFiles, name)
 	dc.dirtyMu.Unlock()
 }
 
@@ -713,6 +730,9 @@ func (dc *DistCache) flushPendingToL2(name string, chunks []pendingChunk) {
 
 	_ = g.Wait()
 	log.Debug("DistCache::flushPendingToL2 : flushed %d chunks for %s", len(chunks), name)
+
+	// L2 is now populated — clear the dirty flag so reads can use it
+	dc.clearDirty(name)
 }
 
 // pendingCleanupLoop periodically evicts pending entries that have exceeded
@@ -774,7 +794,11 @@ func (dc *DistCache) populateCache(name string, filePath string) {
 
 	if err := dc.client.Upload(ctx, name, f, info.Size(), opts...); err != nil {
 		log.Warn("DistCache::populateCache : upload failed: %v", err)
+		return
 	}
+
+	// L2 is now consistent — clear the dirty flag so reads can use it
+	dc.clearDirty(name)
 }
 
 func (dc *DistCache) uploadChunkAsync(name string, offset int64, data []byte) {

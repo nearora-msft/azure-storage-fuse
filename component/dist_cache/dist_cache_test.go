@@ -24,7 +24,10 @@ type mockDCacheClient struct {
 	store             map[string][]byte
 	downloadPartialFn func(ctx context.Context, filename string, fileSize int64, w io.WriterAt, opts ...dcache.DownloadOption) ([]dcache.ChunkError, error)
 	chunkFn           func(ctx context.Context, filename string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
+	uploadFn          func(ctx context.Context, filename string, data io.Reader, size int64, opts ...dcache.UploadOption) error
 	uploadChunkCalled int
+	deleteGroupCalled int
+	lastDeletedGroup  string
 }
 
 func newMockDCacheClient() *mockDCacheClient {
@@ -33,7 +36,10 @@ func newMockDCacheClient() *mockDCacheClient {
 	}
 }
 
-func (m *mockDCacheClient) Upload(_ context.Context, filename string, data io.Reader, size int64, _ ...dcache.UploadOption) error {
+func (m *mockDCacheClient) Upload(ctx context.Context, filename string, data io.Reader, size int64, opts ...dcache.UploadOption) error {
+	if m.uploadFn != nil {
+		return m.uploadFn(ctx, filename, data, size, opts...)
+	}
 	buf := make([]byte, size)
 	io.ReadFull(data, buf)
 	m.store[filename] = buf
@@ -78,6 +84,8 @@ func (m *mockDCacheClient) Delete(_ context.Context, filename string, _ int64) e
 }
 
 func (m *mockDCacheClient) DeleteGroup(_ context.Context, groupID []byte) error {
+	m.deleteGroupCalled++
+	m.lastDeletedGroup = string(groupID)
 	// Remove all entries whose key starts with the group ID (filename)
 	prefix := string(groupID)
 	for k := range m.store {
@@ -854,4 +862,139 @@ func TestCopyToFile_ChunkPollTimeout_FallsThrough(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, next.readInBufferCalled, "should fall through to ReadInBuffer after poll timeout")
 	assert.Equal(t, 0, next.copyToFileCalled, "should NOT call CopyToFile for the entire file")
+}
+
+func TestCopyFromFile_InvalidatesL2(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Pre-populate L2 with old data (simulating stale cached file)
+	mock.store["test/file.txt"] = []byte("old cached content")
+	mock.store["test/file.txt:0"] = []byte("old chunk 0")
+	mock.store["test/file.txt:16777216"] = []byte("old chunk 1")
+
+	f, err := os.CreateTemp("", "dcache-invalidate-*")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	f.WriteString("new file content")
+	f.Seek(0, 0)
+
+	err = dc.CopyFromFile(internal.CopyFromFileOptions{
+		Name: "test/file.txt",
+		File: f,
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, next.copyFromFileCalled, "should write-through to azstorage")
+	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 entry")
+	assert.Equal(t, "test/file.txt", mock.lastDeletedGroup, "should delete the correct group")
+
+	// Verify old chunks were removed
+	_, exists := mock.store["test/file.txt"]
+	assert.False(t, exists, "old whole-file entry should be deleted")
+	_, exists = mock.store["test/file.txt:0"]
+	assert.False(t, exists, "old chunk 0 should be deleted")
+	_, exists = mock.store["test/file.txt:16777216"]
+	assert.False(t, exists, "old chunk 1 should be deleted")
+}
+
+func TestCopyFromFile_MarksDirty(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	f, err := os.CreateTemp("", "dcache-dirty-write-*")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	f.WriteString("content")
+	f.Seek(0, 0)
+
+	err = dc.CopyFromFile(internal.CopyFromFileOptions{
+		Name: "test/dirty-write.txt",
+		File: f,
+	})
+
+	assert.NoError(t, err)
+	assert.True(t, dc.isDirty("test/dirty-write.txt"), "file should be marked dirty after CopyFromFile")
+}
+
+func TestCopyFromFile_DirtyPreventsStaleRead(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{copyToFileData: []byte("fresh from azure")}
+	dc := newTestDistCache(mock, next)
+
+	// Block the async populateCache so clearDirty doesn't fire before our read
+	uploadStarted := make(chan struct{})
+	uploadRelease := make(chan struct{})
+	mock.uploadFn = func(_ context.Context, _ string, _ io.Reader, _ int64, _ ...dcache.UploadOption) error {
+		close(uploadStarted)
+		<-uploadRelease
+		return nil
+	}
+
+	// Pre-populate L2 with stale data (for the download path)
+	staleData := []byte("stale cached version")
+	mock.downloadFn = func(_ context.Context, _ string, _ int64, w io.Writer, _ ...dcache.DownloadOption) (*dcache.FileMetadata, error) {
+		w.Write(staleData)
+		return &dcache.FileMetadata{Size: int64(len(staleData))}, nil
+	}
+
+	// Simulate a write via CopyFromFile
+	wf, err := os.CreateTemp("", "dcache-write-*")
+	require.NoError(t, err)
+	defer os.Remove(wf.Name())
+	wf.WriteString("new content")
+	wf.Seek(0, 0)
+
+	err = dc.CopyFromFile(internal.CopyFromFileOptions{
+		Name: "test/read-after-write.txt",
+		File: wf,
+	})
+	require.NoError(t, err)
+
+	// Wait for the upload goroutine to start (ensures populateCache is in-flight)
+	<-uploadStarted
+
+	// Now a read on the same node should bypass L2 (dirty) and go to azstorage
+	rf, err := os.CreateTemp("", "dcache-read-*")
+	require.NoError(t, err)
+	defer os.Remove(rf.Name())
+	defer rf.Close()
+
+	err = dc.CopyToFile(internal.CopyToFileOptions{
+		Name:  "test/read-after-write.txt",
+		Count: 16,
+		File:  rf,
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, next.copyToFileCalled, "should bypass L2 and go to azstorage for dirty file")
+
+	// Release the upload goroutine and verify dirty is cleared after populate
+	close(uploadRelease)
+	time.Sleep(50 * time.Millisecond)
+	assert.False(t, dc.isDirty("test/read-after-write.txt"), "dirty flag should be cleared after successful L2 populate")
+}
+
+func TestCopyFromFile_NilClientPassesThrough(t *testing.T) {
+	next := &mockNextComponent{}
+	dc := &DistCache{bypassOnError: true, dirtyFiles: make(map[string]time.Time)}
+	dc.SetName(compName)
+	dc.SetNextComponent(next)
+
+	f, err := os.CreateTemp("", "dcache-nil-*")
+	require.NoError(t, err)
+	defer os.Remove(f.Name())
+	f.WriteString("data")
+	f.Seek(0, 0)
+
+	err = dc.CopyFromFile(internal.CopyFromFileOptions{
+		Name: "test/nil-client.txt",
+		File: f,
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, next.copyFromFileCalled)
+	assert.False(t, dc.isDirty("test/nil-client.txt"), "should not mark dirty when client is nil")
 }
