@@ -533,6 +533,10 @@ func TestStageData_SizeCapEvictsPending(t *testing.T) {
 	dc := newTestDistCache(mock, next)
 	dc.conf.MaxFileSizeMB = 1 // 1MB cap
 
+	// Pre-populate L2 with old chunks (simulating previously cached data)
+	mock.store["test/big.bin:0"] = make([]byte, 512*1024)
+	mock.store["test/big.bin:524288"] = make([]byte, 512*1024)
+
 	// Stage a chunk that's under the cap
 	chunk := make([]byte, 512*1024) // 512KB
 	err := dc.StageData(internal.StageDataOptions{
@@ -556,6 +560,14 @@ func TestStageData_SizeCapEvictsPending(t *testing.T) {
 	_, exists := dc.pendingWrites["test/big.bin"]
 	dc.pendingMu.Unlock()
 	assert.False(t, exists, "should evict pending when size cap exceeded")
+
+	// Old L2 chunks should be invalidated to prevent stale reads after dirtyTTL
+	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 entry on size cap")
+	assert.Equal(t, "test/big.bin", mock.lastDeletedGroup)
+	_, exists = mock.store["test/big.bin:0"]
+	assert.False(t, exists, "old L2 chunk should be deleted")
+	_, exists = mock.store["test/big.bin:524288"]
+	assert.False(t, exists, "old L2 chunk should be deleted")
 }
 
 func TestEvictStalePending(t *testing.T) {

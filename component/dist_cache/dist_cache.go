@@ -488,6 +488,10 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 		delete(dc.pendingWrites, options.Name)
 		dc.pendingMu.Unlock()
 		dc.markDirty(options.Name)
+		// Invalidate old L2 entry so stale chunks aren't served after dirtyTTL expires
+		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+			log.Warn("DistCache::StageData : L2 invalidation failed for %s: %v", options.Name, err)
+		}
 		return nil
 	}
 
