@@ -106,6 +106,12 @@ type DistCache struct {
 	pendingMu     sync.Mutex
 	pendingWrites map[string]*pendingFile
 
+	// flushMu protects flushCancel. When a new commit or invalidation arrives
+	// for a file, any in-flight flush goroutine for that file is cancelled to
+	// prevent it from uploading stale data after a DeleteGroup.
+	flushMu     sync.Mutex
+	flushCancel map[string]context.CancelFunc
+
 	// stopCleanup signals the background pending-writes cleanup goroutine to exit.
 	stopCleanup chan struct{}
 }
@@ -132,6 +138,7 @@ func NewDistCacheComponent() internal.Component {
 	comp := &DistCache{
 		dirtyFiles:    make(map[string]time.Time),
 		pendingWrites: make(map[string]*pendingFile),
+		flushCancel:   make(map[string]context.CancelFunc),
 		stopCleanup:   make(chan struct{}),
 	}
 	comp.SetName(compName)
@@ -345,6 +352,9 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 		return nil
 	}
 
+	// Cancel any in-flight flush/populate from a previous write
+	dc.cancelFlush(options.Name)
+
 	// Mark dirty so other nodes bypass stale L2 data during the populate window
 	dc.markDirty(options.Name)
 
@@ -355,7 +365,11 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 	}
 
 	// Populate distributed cache (best-effort, async)
-	go dc.populateCache(options.Name, options.File.Name())
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	dc.flushMu.Lock()
+	dc.flushCancel[options.Name] = cancel
+	dc.flushMu.Unlock()
+	go dc.populateCache(ctx, options.Name, options.File.Name())
 	return nil
 }
 
@@ -487,6 +501,7 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 			dc.conf.MaxFileSizeMB, options.Name)
 		delete(dc.pendingWrites, options.Name)
 		dc.pendingMu.Unlock()
+		dc.cancelFlush(options.Name)
 		dc.markDirty(options.Name)
 		// Invalidate old L2 entry so stale chunks aren't served after dirtyTTL expires
 		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
@@ -527,6 +542,20 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 		return nil
 	}
 
+	// Cancel any in-flight flush from a previous commit. This prevents a racing
+	// goroutine from uploading stale chunks after our DeleteGroup below.
+	dc.cancelFlush(options.Name)
+
+	// Invalidate old L2 entries before flushing new data. CommitData means the
+	// file's block list has changed (via O_TRUNC rewrite, append, or partial
+	// overwrite), so any previously cached chunks are potentially stale.
+	// This must happen BEFORE flushing new chunks to avoid DeleteGroup removing
+	// the freshly uploaded data.
+	dc.markDirty(options.Name)
+	if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+		log.Warn("DistCache::CommitData : L2 invalidation failed for %s: %v", options.Name, err)
+	}
+
 	// Drain pending chunks and flush to L2 asynchronously now that the
 	// file is committed in Azure and safe for other nodes to read.
 	dc.pendingMu.Lock()
@@ -535,7 +564,11 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	dc.pendingMu.Unlock()
 
 	if pf != nil && len(pf.chunks) > 0 {
-		go dc.flushPendingToL2(options.Name, pf.chunks)
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		dc.flushMu.Lock()
+		dc.flushCancel[options.Name] = cancel
+		dc.flushMu.Unlock()
+		go dc.flushPendingToL2(ctx, options.Name, pf.chunks)
 	}
 	return nil
 }
@@ -699,12 +732,21 @@ func (dc *DistCache) clearPending(name string) {
 	dc.pendingMu.Unlock()
 }
 
+// cancelFlush cancels any in-flight flush goroutine for the given file.
+// Must be called before DeleteGroup to prevent a racing flush from re-uploading
+// stale data after the group has been deleted.
+func (dc *DistCache) cancelFlush(name string) {
+	dc.flushMu.Lock()
+	if cancel, ok := dc.flushCancel[name]; ok {
+		cancel()
+		delete(dc.flushCancel, name)
+	}
+	dc.flushMu.Unlock()
+}
+
 // flushPendingToL2 uploads all buffered chunks for a file to the distributed
 // cache. Called asynchronously after CommitData succeeds.
-func (dc *DistCache) flushPendingToL2(name string, chunks []pendingChunk) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
+func (dc *DistCache) flushPendingToL2(ctx context.Context, name string, chunks []pendingChunk) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(maxPendingL2Uploads)
 
@@ -735,8 +777,16 @@ func (dc *DistCache) flushPendingToL2(name string, chunks []pendingChunk) {
 	_ = g.Wait()
 	log.Debug("DistCache::flushPendingToL2 : flushed %d chunks for %s", len(chunks), name)
 
-	// L2 is now populated — clear the dirty flag so reads can use it
-	dc.clearDirty(name)
+	// Only clear dirty if we weren't cancelled (a cancellation means a new
+	// commit/invalidation is in progress and will manage the dirty state).
+	if ctx.Err() == nil {
+		dc.clearDirty(name)
+	}
+
+	// Clean up the cancel entry
+	dc.flushMu.Lock()
+	delete(dc.flushCancel, name)
+	dc.flushMu.Unlock()
 }
 
 // pendingCleanupLoop periodically evicts pending entries that have exceeded
@@ -769,9 +819,12 @@ func (dc *DistCache) evictStalePending() {
 	dc.pendingMu.Unlock()
 }
 
-func (dc *DistCache) populateCache(name string, filePath string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+func (dc *DistCache) populateCache(ctx context.Context, name string, filePath string) {
+	defer func() {
+		dc.flushMu.Lock()
+		delete(dc.flushCancel, name)
+		dc.flushMu.Unlock()
+	}()
 
 	// Re-open the file by path (the original handle may be closed by the caller)
 	f, err := os.Open(filePath)
@@ -801,8 +854,10 @@ func (dc *DistCache) populateCache(name string, filePath string) {
 		return
 	}
 
-	// L2 is now consistent — clear the dirty flag so reads can use it
-	dc.clearDirty(name)
+	// Only clear dirty if we weren't cancelled
+	if ctx.Err() == nil {
+		dc.clearDirty(name)
+	}
 }
 
 func (dc *DistCache) uploadChunkAsync(name string, offset int64, data []byte) {

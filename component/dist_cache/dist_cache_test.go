@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ type mockDCacheClient struct {
 	downloadPartialFn func(ctx context.Context, filename string, fileSize int64, w io.WriterAt, opts ...dcache.DownloadOption) ([]dcache.ChunkError, error)
 	chunkFn           func(ctx context.Context, filename string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
 	uploadFn          func(ctx context.Context, filename string, data io.Reader, size int64, opts ...dcache.UploadOption) error
+	uploadChunkFn     func(ctx context.Context, filename string, offset int64, data []byte) error
 	uploadChunkCalled int
 	deleteGroupCalled int
 	lastDeletedGroup  string
@@ -71,7 +73,10 @@ func (m *mockDCacheClient) DownloadChunk(ctx context.Context, filename string, o
 	return n, nil
 }
 
-func (m *mockDCacheClient) UploadChunk(_ context.Context, filename string, offset int64, data []byte, _ ...dcache.UploadOption) error {
+func (m *mockDCacheClient) UploadChunk(ctx context.Context, filename string, offset int64, data []byte, _ ...dcache.UploadOption) error {
+	if m.uploadChunkFn != nil {
+		return m.uploadChunkFn(ctx, filename, offset, data)
+	}
 	m.uploadChunkCalled++
 	key := fmt.Sprintf("%s:%d", filename, offset)
 	m.store[key] = append([]byte(nil), data...)
@@ -182,6 +187,7 @@ func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCach
 		bypassOnError: true,
 		dirtyFiles:    make(map[string]time.Time),
 		pendingWrites: make(map[string]*pendingFile),
+		flushCancel:   make(map[string]context.CancelFunc),
 		stopCleanup:   make(chan struct{}),
 	}
 	dc.SetName(compName)
@@ -613,12 +619,20 @@ func TestCommitData_ForwardOnly(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Equal(t, 1, next.commitDataCalled)
+	// CommitData should always invalidate old L2 entries
+	assert.Equal(t, 1, mock.deleteGroupCalled)
+	assert.Equal(t, "test/file.bin", mock.lastDeletedGroup)
 }
 
 func TestCommitData_FlushesPendingToL2(t *testing.T) {
 	mock := newMockDCacheClient()
 	next := &mockNextComponent{}
 	dc := newTestDistCache(mock, next)
+
+	// Pre-populate L2 with old chunks (simulating a previously cached file)
+	mock.store["test/file.bin:0"] = []byte("old-chunk-0")
+	mock.store["test/file.bin:4096"] = []byte("old-chunk-1")
+	mock.store["test/file.bin:8192"] = []byte("old-chunk-2")
 
 	// Stage chunks first
 	_ = dc.StageData(internal.StageDataOptions{
@@ -648,13 +662,92 @@ func TestCommitData_FlushesPendingToL2(t *testing.T) {
 	dc.pendingMu.Unlock()
 	assert.False(t, exists, "pending chunks should be drained after commit")
 
+	// DeleteGroup should have been called to invalidate old L2 data
+	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 before flushing new data")
+	assert.Equal(t, "test/file.bin", mock.lastDeletedGroup)
+
+	// Old chunk beyond new file extent should be gone
+	_, exists = mock.store["test/file.bin:8192"]
+	assert.False(t, exists, "old L2 chunk beyond new extent should be deleted")
+
 	// Wait briefly for the async flush goroutine to complete
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify chunks were uploaded to L2
+	// Verify new chunks were uploaded to L2 (after DeleteGroup cleared old ones)
 	assert.Equal(t, 2, mock.uploadChunkCalled, "should flush both chunks to L2")
 	assert.Equal(t, []byte("chunk-0"), mock.store["test/file.bin:0"])
 	assert.Equal(t, []byte("chunk-1"), mock.store["test/file.bin:4096"])
+}
+
+func TestCommitData_CancelsPreviousFlush(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Gate that blocks UploadChunk until we release it or the context is cancelled
+	gate := make(chan struct{})
+	var cancelledChunks int32
+	var uploadedChunks int32
+
+	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
+		select {
+		case <-ctx.Done():
+			atomic.AddInt32(&cancelledChunks, 1)
+			return ctx.Err()
+		case <-gate:
+			atomic.AddInt32(&uploadedChunks, 1)
+			key := fmt.Sprintf("%s:%d", filename, offset)
+			mock.store[key] = append([]byte(nil), data...)
+			return nil
+		}
+	}
+
+	// Stage chunks for commit #1 (large file)
+	for i := 0; i < 4; i++ {
+		_ = dc.StageData(internal.StageDataOptions{
+			Name: "test/file.bin", Offset: uint64(i * 4096), Data: []byte(fmt.Sprintf("old-chunk-%d", i)), Id: fmt.Sprintf("b%d", i),
+		})
+	}
+
+	// Commit #1: starts an async flush that will block on the gate
+	err := dc.CommitData(internal.CommitDataOptions{
+		Name: "test/file.bin",
+		List: []string{"b0", "b1", "b2", "b3"},
+	})
+	assert.NoError(t, err)
+
+	// Give the flush goroutine time to start and block
+	time.Sleep(50 * time.Millisecond)
+
+	// Stage chunks for commit #2 (smaller file rewrite via O_TRUNC)
+	_ = dc.StageData(internal.StageDataOptions{
+		Name: "test/file.bin", Offset: 0, Data: []byte("new-chunk-0"), Id: "c0",
+	})
+
+	// Commit #2: should cancel flush #1 before doing DeleteGroup + its own flush
+	err = dc.CommitData(internal.CommitDataOptions{
+		Name: "test/file.bin",
+		List: []string{"c0"},
+	})
+	assert.NoError(t, err)
+
+	// Now unblock the gate so flush #2 can proceed
+	close(gate)
+
+	// Wait for flush #2 to complete
+	time.Sleep(100 * time.Millisecond)
+
+	// Flush #1's chunks should have been cancelled (not uploaded)
+	assert.True(t, atomic.LoadInt32(&cancelledChunks) > 0, "flush #1 should have been cancelled")
+
+	// Flush #2's new chunk should have been uploaded
+	assert.Equal(t, []byte("new-chunk-0"), mock.store["test/file.bin:0"])
+
+	// Old chunks from flush #1 should NOT be in L2
+	_, exists := mock.store["test/file.bin:4096"]
+	assert.False(t, exists, "old chunk from cancelled flush should not be in L2")
+	_, exists = mock.store["test/file.bin:8192"]
+	assert.False(t, exists, "old chunk from cancelled flush should not be in L2")
 }
 
 func TestDeleteFile_Invalidation(t *testing.T) {
