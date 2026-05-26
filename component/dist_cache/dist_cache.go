@@ -507,18 +507,14 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 
 	// Size cap: if buffering this chunk would exceed MaxFileSizeMB, drop all
 	// pending data for this file. L2 will be warmed via the read path instead.
+	// No need to invalidate L2 here — the committed state hasn't changed, so
+	// existing L2 data is still valid. CommitData will handle invalidation if
+	// and when the write is actually committed.
 	if maxSize > 0 && pf != nil && pf.totalSize+dataLen > maxSize {
 		log.Debug("DistCache::StageData : pending size would exceed %dMB for %s, skipping L2 write-warming",
 			dc.conf.MaxFileSizeMB, options.Name)
 		delete(dc.pendingWrites, options.Name)
 		dc.pendingMu.Unlock()
-		dc.cancelFlush(options.Name)
-		dc.markDirty(options.Name)
-		// Invalidate old L2 entry so stale chunks aren't served after dirtyTTL expires
-		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
-			log.Warn("DistCache::StageData : L2 invalidation failed for %s: %v", options.Name, err)
-		}
-		dc.bumpVersion(options.Name)
 		return nil
 	}
 
@@ -538,8 +534,6 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 	pf.lastActivity = time.Now()
 	dc.pendingMu.Unlock()
 
-	// Mark dirty so local reads also bypass L2 during the write window
-	dc.markDirty(options.Name)
 	return nil
 }
 

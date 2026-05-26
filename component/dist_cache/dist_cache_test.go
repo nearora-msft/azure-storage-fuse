@@ -597,13 +597,13 @@ func TestStageData_SizeCapEvictsPending(t *testing.T) {
 	dc.pendingMu.Unlock()
 	assert.False(t, exists, "should evict pending when size cap exceeded")
 
-	// Old L2 chunks should be invalidated to prevent stale reads after dirtyTTL
-	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 entry on size cap")
-	assert.Equal(t, "test/big.bin\x00v0", mock.lastDeletedGroup)
+	// L2 should NOT be invalidated — the committed state hasn't changed,
+	// so existing L2 data is still valid. CommitData handles invalidation.
+	assert.Equal(t, 0, mock.deleteGroupCalled, "should not invalidate L2 on size cap (committed state unchanged)")
 	_, exists = mock.store["test/big.bin:0"]
-	assert.False(t, exists, "old L2 chunk should be deleted")
+	assert.True(t, exists, "L2 chunk should remain (still valid)")
 	_, exists = mock.store["test/big.bin:524288"]
-	assert.False(t, exists, "old L2 chunk should be deleted")
+	assert.True(t, exists, "L2 chunk should remain (still valid)")
 }
 
 func TestEvictStalePending(t *testing.T) {
