@@ -206,6 +206,77 @@ func (c *Client) DownloadChunk(ctx context.Context, filename string, offset int6
 	return n, err
 }
 
+// GetChunkGroupID retrieves the group ID stored in the metadata of chunk 0 for
+// the given file. This allows callers to discover which group ID was used when
+// uploading, even across process restarts. Returns nil if the chunk doesn't
+// exist or has no "gid" metadata.
+func (c *Client) GetChunkGroupID(ctx context.Context, filename string) ([]byte, error) {
+	if err := c.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	cacheKey := GenerateCacheKey(c.cfg.cachePrefix, filename, 0, c.cfg.chunkSize)
+	server, err := c.disc.getServer(cacheKey)
+	if err != nil {
+		return nil, err
+	}
+
+	cn, err := c.connMgr.getConn(server)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := cn.setDeadline(c.deadline(ctx)); err != nil {
+		c.connMgr.discardConn(cn)
+		return nil, err
+	}
+
+	// Request only 1 byte to minimize data transfer; we only need the metadata.
+	req := &pb.Request{
+		Payload: &pb.Request_Downloadrequest{
+			Downloadrequest: &pb.DownloadRequest{
+				Filename: cacheKey,
+				Offset:   0,
+				Length:   1,
+			},
+		},
+	}
+
+	if err := cn.sendRequest(req, nil); err != nil {
+		c.connMgr.discardConn(cn)
+		return nil, err
+	}
+
+	var resp pb.DownloadResponse
+	if err := cn.recvProto(&resp); err != nil {
+		c.connMgr.discardConn(cn)
+		return nil, err
+	}
+
+	if err := downloadResultToError(resp.Result); err != nil {
+		c.connMgr.putConn(cn)
+		return nil, err
+	}
+
+	// Read and discard the data bytes (should be 1 byte for Length=1).
+	dataSize := int(resp.Filesize)
+	if dataSize > 0 {
+		discard := make([]byte, dataSize)
+		if err := cn.recvDataToBuffer(discard); err != nil {
+			c.connMgr.discardConn(cn)
+			return nil, err
+		}
+	}
+
+	c.connMgr.putConn(cn)
+
+	meta := protoToByteMap(resp.Metadata)
+	if meta == nil {
+		return nil, nil
+	}
+	return meta["gid"], nil
+}
+
 // UploadChunk stores a single chunk at the given offset.
 // Ideal for block_cache StageData integration.
 func (c *Client) UploadChunk(ctx context.Context, filename string, offset int64, data []byte, opts ...UploadOption) error {

@@ -112,6 +112,13 @@ type DistCache struct {
 	flushMu     sync.Mutex
 	flushCancel map[string]context.CancelFunc
 
+	// versionMu protects fileVersions. Each file has a monotonically increasing
+	// version number used to construct versioned group IDs. This ensures that
+	// an async server-side DeleteGroup for version N cannot affect chunks
+	// uploaded under version N+1.
+	versionMu    sync.Mutex
+	fileVersions map[string]uint64
+
 	// stopCleanup signals the background pending-writes cleanup goroutine to exit.
 	stopCleanup chan struct{}
 }
@@ -126,6 +133,7 @@ type dcacheClient interface {
 	UploadChunk(ctx context.Context, filename string, offset int64, data []byte, opts ...dcache.UploadOption) error
 	Delete(ctx context.Context, filename string, fileSize int64) error
 	DeleteGroup(ctx context.Context, groupID []byte) error
+	GetChunkGroupID(ctx context.Context, filename string) ([]byte, error)
 	GetAttr(ctx context.Context, filename string) (*dcache.FileAttr, error)
 	PutAttr(ctx context.Context, attrs []dcache.FileAttrEntry) error
 	Close() error
@@ -139,6 +147,7 @@ func NewDistCacheComponent() internal.Component {
 		dirtyFiles:    make(map[string]time.Time),
 		pendingWrites: make(map[string]*pendingFile),
 		flushCancel:   make(map[string]context.CancelFunc),
+		fileVersions:  make(map[string]uint64),
 		stopCleanup:   make(chan struct{}),
 	}
 	comp.SetName(compName)
@@ -358,18 +367,20 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 	// Mark dirty so other nodes bypass stale L2 data during the populate window
 	dc.markDirty(options.Name)
 
-	// Invalidate old L2 entry to prevent serving stale chunks (e.g. if the
-	// new file is smaller, leftover chunks from the old version would remain)
-	if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+	// Invalidate old L2 entry. Query the server to discover the actual group
+	// ID (handles crash/restart where local version was lost), then bump so
+	// the new upload uses a different group ID.
+	if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 		log.Warn("DistCache::CopyFromFile : L2 invalidation failed for %s: %v", options.Name, err)
 	}
+	newVer := dc.bumpVersion(options.Name)
 
 	// Populate distributed cache (best-effort, async)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	dc.flushMu.Lock()
 	dc.flushCancel[options.Name] = cancel
 	dc.flushMu.Unlock()
-	go dc.populateCache(ctx, options.Name, options.File.Name())
+	go dc.populateCache(ctx, options.Name, options.File.Name(), newVer)
 	return nil
 }
 
@@ -504,9 +515,10 @@ func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 		dc.cancelFlush(options.Name)
 		dc.markDirty(options.Name)
 		// Invalidate old L2 entry so stale chunks aren't served after dirtyTTL expires
-		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::StageData : L2 invalidation failed for %s: %v", options.Name, err)
 		}
+		dc.bumpVersion(options.Name)
 		return nil
 	}
 
@@ -549,12 +561,13 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	// Invalidate old L2 entries before flushing new data. CommitData means the
 	// file's block list has changed (via O_TRUNC rewrite, append, or partial
 	// overwrite), so any previously cached chunks are potentially stale.
-	// This must happen BEFORE flushing new chunks to avoid DeleteGroup removing
-	// the freshly uploaded data.
+	// Query the server for the actual group ID (handles crash/restart), then
+	// bump so the flush uses a new group ID safe from async deletion.
 	dc.markDirty(options.Name)
-	if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+	if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 		log.Warn("DistCache::CommitData : L2 invalidation failed for %s: %v", options.Name, err)
 	}
+	newVer := dc.bumpVersion(options.Name)
 
 	// Drain pending chunks and flush to L2 asynchronously now that the
 	// file is committed in Azure and safe for other nodes to read.
@@ -568,7 +581,7 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 		dc.flushMu.Lock()
 		dc.flushCancel[options.Name] = cancel
 		dc.flushMu.Unlock()
-		go dc.flushPendingToL2(ctx, options.Name, pf.chunks)
+		go dc.flushPendingToL2(ctx, options.Name, pf.chunks, newVer)
 	}
 	return nil
 }
@@ -579,9 +592,10 @@ func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 	if dc.client != nil {
 		dc.markDirty(options.Name)
 		dc.clearPending(options.Name)
-		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::DeleteFile : cache invalidation failed for %s: %v", options.Name, err)
 		}
+		dc.bumpVersion(options.Name)
 	}
 	return dc.NextComponent().DeleteFile(options)
 }
@@ -590,9 +604,10 @@ func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 	if dc.client != nil {
 		dc.markDirty(options.Src)
 		dc.clearPending(options.Src)
-		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Src)); err != nil {
+		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Src)); err != nil {
 			log.Warn("DistCache::RenameFile : cache invalidation failed for %s: %v", options.Src, err)
 		}
+		dc.bumpVersion(options.Src)
 	}
 	return dc.NextComponent().RenameFile(options)
 }
@@ -601,9 +616,10 @@ func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
 	if dc.client != nil {
 		dc.markDirty(options.Name)
 		dc.clearPending(options.Name)
-		if err := dc.client.DeleteGroup(context.Background(), fileGroupID(options.Name)); err != nil {
+		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::TruncateFile : cache invalidation failed for %s: %v", options.Name, err)
 		}
+		dc.bumpVersion(options.Name)
 	}
 	return dc.NextComponent().TruncateFile(options)
 }
@@ -719,10 +735,12 @@ func (dc *DistCache) isDirty(name string) bool {
 	return ok
 }
 
-// fileGroupID returns a deterministic group ID for a file, used for group-based
-// cache invalidation. All chunks of the same file share this group ID.
-func fileGroupID(name string) []byte {
-	return []byte(name)
+// fileGroupID returns a versioned group ID for a file. All chunks uploaded in
+// the same version share this ID. Using a version suffix ensures that an async
+// server-side DeleteGroup for an older version cannot affect chunks uploaded
+// under a newer version.
+func fileGroupID(name string, version uint64) []byte {
+	return []byte(fmt.Sprintf("%s\x00v%d", name, version))
 }
 
 // clearPending discards any buffered chunks for a file (e.g. on delete/truncate).
@@ -730,6 +748,42 @@ func (dc *DistCache) clearPending(name string) {
 	dc.pendingMu.Lock()
 	delete(dc.pendingWrites, name)
 	dc.pendingMu.Unlock()
+}
+
+// getVersion returns the current group version for a file.
+func (dc *DistCache) getVersion(name string) uint64 {
+	dc.versionMu.Lock()
+	v := dc.fileVersions[name]
+	dc.versionMu.Unlock()
+	return v
+}
+
+// bumpVersion increments the group version for a file and returns the new version.
+// Must be called after DeleteGroup so that subsequent uploads use a new group ID
+// that won't be affected by the async server-side deletion.
+func (dc *DistCache) bumpVersion(name string) uint64 {
+	dc.versionMu.Lock()
+	dc.fileVersions[name]++
+	v := dc.fileVersions[name]
+	dc.versionMu.Unlock()
+	return v
+}
+
+// resolveServerGroupID queries the server for the actual group ID stored in
+// chunk metadata. This handles the case where the local version counter was
+// lost (e.g., after a crash/restart) and the server has chunks under a
+// different version. Falls back to the local version if the server has no data.
+func (dc *DistCache) resolveServerGroupID(name string) []byte {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverGID, err := dc.client.GetChunkGroupID(ctx, name)
+	if err == nil && serverGID != nil {
+		return serverGID
+	}
+
+	// Server has no data or error — use local version (best effort)
+	return fileGroupID(name, dc.getVersion(name))
 }
 
 // cancelFlush cancels any in-flight flush goroutine for the given file.
@@ -745,8 +799,9 @@ func (dc *DistCache) cancelFlush(name string) {
 }
 
 // flushPendingToL2 uploads all buffered chunks for a file to the distributed
-// cache. Called asynchronously after CommitData succeeds.
-func (dc *DistCache) flushPendingToL2(ctx context.Context, name string, chunks []pendingChunk) {
+// cache. Called asynchronously after CommitData succeeds. The version parameter
+// is the bumped version to use for the new group ID.
+func (dc *DistCache) flushPendingToL2(ctx context.Context, name string, chunks []pendingChunk, version uint64) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(maxPendingL2Uploads)
 
@@ -759,9 +814,11 @@ func (dc *DistCache) flushPendingToL2(ctx context.Context, name string, chunks [
 			default:
 			}
 
+			gid := fileGroupID(name, version)
 			opts := []dcache.UploadOption{
 				dcache.WithIgnoreLock(true),
-				dcache.WithGroupID(fileGroupID(name)),
+				dcache.WithGroupID(gid),
+				dcache.WithMetadata(map[string][]byte{"gid": gid}),
 			}
 			if dc.conf.TTLSeconds > 0 {
 				opts = append(opts, dcache.WithTTL(dc.conf.TTLSeconds))
@@ -819,7 +876,7 @@ func (dc *DistCache) evictStalePending() {
 	dc.pendingMu.Unlock()
 }
 
-func (dc *DistCache) populateCache(ctx context.Context, name string, filePath string) {
+func (dc *DistCache) populateCache(ctx context.Context, name string, filePath string, version uint64) {
 	defer func() {
 		dc.flushMu.Lock()
 		delete(dc.flushCancel, name)
@@ -841,9 +898,11 @@ func (dc *DistCache) populateCache(ctx context.Context, name string, filePath st
 		return
 	}
 
+	gid := fileGroupID(name, version)
 	opts := []dcache.UploadOption{
 		dcache.WithIgnoreLock(true),
-		dcache.WithGroupID(fileGroupID(name)),
+		dcache.WithGroupID(gid),
+		dcache.WithMetadata(map[string][]byte{"gid": gid}),
 	}
 	if dc.conf.TTLSeconds > 0 {
 		opts = append(opts, dcache.WithTTL(dc.conf.TTLSeconds))
@@ -864,9 +923,11 @@ func (dc *DistCache) uploadChunkAsync(name string, offset int64, data []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	gid := fileGroupID(name, dc.getVersion(name))
 	opts := []dcache.UploadOption{
 		dcache.WithIgnoreLock(true),
-		dcache.WithGroupID(fileGroupID(name)),
+		dcache.WithGroupID(gid),
+		dcache.WithMetadata(map[string][]byte{"gid": gid}),
 	}
 	if dc.conf.TTLSeconds > 0 {
 		opts = append(opts, dcache.WithTTL(dc.conf.TTLSeconds))
