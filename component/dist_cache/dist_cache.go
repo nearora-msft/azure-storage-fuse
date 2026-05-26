@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -370,10 +371,11 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 	// Invalidate old L2 entry. Query the server to discover the actual group
 	// ID (handles crash/restart where local version was lost), then bump so
 	// the new upload uses a different group ID.
-	if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
+	serverGID := dc.resolveServerGroupID(options.Name)
+	if err := dc.client.DeleteGroup(context.Background(), serverGID); err != nil {
 		log.Warn("DistCache::CopyFromFile : L2 invalidation failed for %s: %v", options.Name, err)
 	}
-	newVer := dc.bumpVersion(options.Name)
+	newVer := dc.bumpVersion(options.Name, serverGID)
 
 	// Populate distributed cache (best-effort, async)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -558,10 +560,11 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	// Query the server for the actual group ID (handles crash/restart), then
 	// bump so the flush uses a new group ID safe from async deletion.
 	dc.markDirty(options.Name)
-	if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
+	serverGID := dc.resolveServerGroupID(options.Name)
+	if err := dc.client.DeleteGroup(context.Background(), serverGID); err != nil {
 		log.Warn("DistCache::CommitData : L2 invalidation failed for %s: %v", options.Name, err)
 	}
-	newVer := dc.bumpVersion(options.Name)
+	newVer := dc.bumpVersion(options.Name, serverGID)
 
 	// Drain pending chunks and flush to L2 asynchronously now that the
 	// file is committed in Azure and safe for other nodes to read.
@@ -589,7 +592,6 @@ func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::DeleteFile : cache invalidation failed for %s: %v", options.Name, err)
 		}
-		dc.bumpVersion(options.Name)
 	}
 	return dc.NextComponent().DeleteFile(options)
 }
@@ -601,7 +603,6 @@ func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Src)); err != nil {
 			log.Warn("DistCache::RenameFile : cache invalidation failed for %s: %v", options.Src, err)
 		}
-		dc.bumpVersion(options.Src)
 	}
 	return dc.NextComponent().RenameFile(options)
 }
@@ -613,7 +614,6 @@ func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
 		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
 			log.Warn("DistCache::TruncateFile : cache invalidation failed for %s: %v", options.Name, err)
 		}
-		dc.bumpVersion(options.Name)
 	}
 	return dc.NextComponent().TruncateFile(options)
 }
@@ -737,6 +737,21 @@ func fileGroupID(name string, version uint64) []byte {
 	return []byte(fmt.Sprintf("%s\x00v%d", name, version))
 }
 
+// parseGroupVersion extracts the version number from a group ID byte slice.
+// Group IDs have the format "<name>\x00v<version>". Returns 0 if parsing fails.
+func parseGroupVersion(groupID []byte) uint64 {
+	s := string(groupID)
+	idx := strings.LastIndex(s, "\x00v")
+	if idx < 0 {
+		return 0
+	}
+	v, err := strconv.ParseUint(s[idx+2:], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
 // clearPending discards any buffered chunks for a file (e.g. on delete/truncate).
 func (dc *DistCache) clearPending(name string) {
 	dc.pendingMu.Lock()
@@ -752,11 +767,16 @@ func (dc *DistCache) getVersion(name string) uint64 {
 	return v
 }
 
-// bumpVersion increments the group version for a file and returns the new version.
-// Must be called after DeleteGroup so that subsequent uploads use a new group ID
-// that won't be affected by the async server-side deletion.
-func (dc *DistCache) bumpVersion(name string) uint64 {
+// bumpVersion advances the group version for a file past both the local counter
+// and the server-side version (extracted from serverGID), returning the new version.
+// This ensures that after a crash/restart where the local counter resets to 0,
+// we never reuse a version that previously existed on the server.
+func (dc *DistCache) bumpVersion(name string, serverGID []byte) uint64 {
+	serverVer := parseGroupVersion(serverGID)
 	dc.versionMu.Lock()
+	if serverVer > dc.fileVersions[name] {
+		dc.fileVersions[name] = serverVer
+	}
 	dc.fileVersions[name]++
 	v := dc.fileVersions[name]
 	dc.versionMu.Unlock()

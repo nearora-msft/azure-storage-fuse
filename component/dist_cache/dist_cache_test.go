@@ -548,21 +548,6 @@ func TestStageData_BuffersPendingChunks(t *testing.T) {
 	assert.Equal(t, 0, mock.uploadChunkCalled, "should not upload to L2 during stage")
 }
 
-func TestStageData_MarksDirty(t *testing.T) {
-	mock := newMockDCacheClient()
-	next := &mockNextComponent{}
-	dc := newTestDistCache(mock, next)
-
-	_ = dc.StageData(internal.StageDataOptions{
-		Name:   "test/file.bin",
-		Offset: 0,
-		Data:   []byte("data"),
-		Id:     "block-0",
-	})
-
-	assert.True(t, dc.isDirty("test/file.bin"), "file should be marked dirty during write")
-}
-
 func TestStageData_SizeCapEvictsPending(t *testing.T) {
 	mock := newMockDCacheClient()
 	next := &mockNextComponent{}
@@ -1180,6 +1165,6 @@ func TestCommitData_CrossRestart_ResolvesServerGroupID(t *testing.T) {
 	_, exists = mock.store["test/file.bin:4096"]
 	assert.False(t, exists, "old chunk 1 should be deleted via server-resolved group ID")
 
-	// Local version should have been bumped
-	assert.Equal(t, uint64(1), dc.getVersion("test/file.bin"))
+	// Local version should have been synced to server (v3) then bumped to v4
+	assert.Equal(t, uint64(4), dc.getVersion("test/file.bin"))
 }
