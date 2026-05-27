@@ -113,6 +113,13 @@ type DistCache struct {
 	flushMu     sync.Mutex
 	flushCancel map[string]context.CancelFunc
 
+	// readUploadMu protects readUploadCancels. Read-path uploadChunkAsync
+	// goroutines share a per-file context so they can be cancelled when a
+	// write/invalidation arrives, preventing stale data from overwriting
+	// freshly flushed chunks.
+	readUploadMu      sync.Mutex
+	readUploadCancels map[string]*readUploadEntry
+
 	// versionMu protects fileVersions. Each file has a monotonically increasing
 	// version number used to construct versioned group IDs. This ensures that
 	// an async server-side DeleteGroup for version N cannot affect chunks
@@ -145,11 +152,12 @@ var _ internal.Component = &DistCache{}
 
 func NewDistCacheComponent() internal.Component {
 	comp := &DistCache{
-		dirtyFiles:    make(map[string]time.Time),
-		pendingWrites: make(map[string]*pendingFile),
-		flushCancel:   make(map[string]context.CancelFunc),
-		fileVersions:  make(map[string]uint64),
-		stopCleanup:   make(chan struct{}),
+		dirtyFiles:        make(map[string]time.Time),
+		pendingWrites:     make(map[string]*pendingFile),
+		flushCancel:       make(map[string]context.CancelFunc),
+		readUploadCancels: make(map[string]*readUploadEntry),
+		fileVersions:      make(map[string]uint64),
+		stopCleanup:       make(chan struct{}),
 	}
 	comp.SetName(compName)
 	return comp
@@ -365,6 +373,9 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 	// Cancel any in-flight flush/populate from a previous write
 	dc.cancelFlush(options.Name)
 
+	// Cancel any in-flight read-path uploads that may overwrite our fresh data
+	dc.cancelReadUploads(options.Name)
+
 	// Mark dirty so other nodes bypass stale L2 data during the populate window
 	dc.markDirty(options.Name)
 
@@ -431,7 +442,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
 		if n > 0 {
 			dataCopy := make([]byte, n)
 			copy(dataCopy, options.Data[:n])
-			go dc.uploadChunkAsync(name, options.Offset, dataCopy)
+			uploadCtx := dc.getReadUploadCtx(name)
+			go dc.uploadChunkAsync(uploadCtx, name, options.Offset, dataCopy, dc.getVersion(name))
 		}
 		return n, nil
 	}
@@ -445,7 +457,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
 		}
 		dataCopy := make([]byte, n)
 		copy(dataCopy, options.Data[:n])
-		go dc.uploadChunkAsync(name, options.Offset, dataCopy)
+		uploadCtx := dc.getReadUploadCtx(name)
+		go dc.uploadChunkAsync(uploadCtx, name, options.Offset, dataCopy, dc.getVersion(name))
 		return n, nil
 	}
 
@@ -464,7 +477,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
 		}
 		dataCopy := make([]byte, n)
 		copy(dataCopy, options.Data[:n])
-		go dc.uploadChunkAsync(name, options.Offset, dataCopy)
+		uploadCtx := dc.getReadUploadCtx(name)
+		go dc.uploadChunkAsync(uploadCtx, name, options.Offset, dataCopy, dc.getVersion(name))
 		return n, nil
 	}
 
@@ -477,7 +491,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
 		}
 		dataCopy := make([]byte, n)
 		copy(dataCopy, options.Data[:n])
-		go dc.uploadChunkAsync(name, options.Offset, dataCopy)
+		uploadCtx := dc.getReadUploadCtx(name)
+		go dc.uploadChunkAsync(uploadCtx, name, options.Offset, dataCopy, dc.getVersion(name))
 		return n, nil
 	}
 
@@ -554,6 +569,9 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	// goroutine from uploading stale chunks after our DeleteGroup below.
 	dc.cancelFlush(options.Name)
 
+	// Cancel any in-flight read-path uploads that may overwrite our fresh data
+	dc.cancelReadUploads(options.Name)
+
 	// Invalidate old L2 entries before flushing new data. CommitData means the
 	// file's block list has changed (via O_TRUNC rewrite, append, or partial
 	// overwrite), so any previously cached chunks are potentially stale.
@@ -587,6 +605,7 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 
 func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 	if dc.client != nil {
+		dc.cancelReadUploads(options.Name)
 		dc.markDirty(options.Name)
 		dc.clearPending(options.Name)
 		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
@@ -598,6 +617,7 @@ func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 
 func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 	if dc.client != nil {
+		dc.cancelReadUploads(options.Src)
 		dc.markDirty(options.Src)
 		dc.clearPending(options.Src)
 		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Src)); err != nil {
@@ -609,6 +629,7 @@ func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 
 func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
 	if dc.client != nil {
+		dc.cancelReadUploads(options.Name)
 		dc.markDirty(options.Name)
 		dc.clearPending(options.Name)
 		if err := dc.client.DeleteGroup(context.Background(), dc.resolveServerGroupID(options.Name)); err != nil {
@@ -647,7 +668,8 @@ func (dc *DistCache) fetchChunkFromRemote(ctx context.Context, options internal.
 	if populateCache {
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buf[:n])
-		go dc.uploadChunkAsync(options.Name, offset, dataCopy)
+		uploadCtx := dc.getReadUploadCtx(options.Name)
+		go dc.uploadChunkAsync(uploadCtx, options.Name, offset, dataCopy, dc.getVersion(options.Name))
 	}
 	return nil
 }
@@ -933,11 +955,54 @@ func (dc *DistCache) populateCache(ctx context.Context, name string, filePath st
 	}
 }
 
-func (dc *DistCache) uploadChunkAsync(name string, offset int64, data []byte) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// readUploadEntry holds a shared context for read-path uploads on a single file.
+type readUploadEntry struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
 
-	gid := fileGroupID(name, dc.getVersion(name))
+// getReadUploadCtx returns a cancellable context for read-path uploads on the
+// given file. All uploadChunkAsync goroutines for the same file share this
+// context so they can be bulk-cancelled when a write arrives.
+func (dc *DistCache) getReadUploadCtx(name string) context.Context {
+	dc.readUploadMu.Lock()
+	defer dc.readUploadMu.Unlock()
+
+	if entry, ok := dc.readUploadCancels[name]; ok {
+		// Reuse existing context if it hasn't been cancelled
+		if entry.ctx.Err() == nil {
+			return entry.ctx
+		}
+		// Previous context was cancelled (by a write), create a fresh one
+		delete(dc.readUploadCancels, name)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	dc.readUploadCancels[name] = &readUploadEntry{ctx: ctx, cancel: cancel}
+	return ctx
+}
+
+// cancelReadUploads cancels all in-flight read-path uploadChunkAsync goroutines
+// for the given file. Called from write/invalidation paths to prevent stale
+// read data from overwriting freshly committed chunks.
+func (dc *DistCache) cancelReadUploads(name string) {
+	dc.readUploadMu.Lock()
+	if entry, ok := dc.readUploadCancels[name]; ok {
+		entry.cancel()
+		delete(dc.readUploadCancels, name)
+	}
+	dc.readUploadMu.Unlock()
+}
+
+func (dc *DistCache) uploadChunkAsync(ctx context.Context, name string, offset int64, data []byte, version uint64) {
+	// Respect cancellation from write path
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	gid := fileGroupID(name, version)
 	opts := []dcache.UploadOption{
 		dcache.WithIgnoreLock(true),
 		dcache.WithGroupID(gid),
@@ -948,6 +1013,10 @@ func (dc *DistCache) uploadChunkAsync(name string, offset int64, data []byte) {
 	}
 
 	if err := dc.client.UploadChunk(ctx, name, offset, data, opts...); err != nil {
+		if ctx.Err() != nil {
+			log.Debug("DistCache::uploadChunkAsync : cancelled for %s offset=%d", name, offset)
+			return
+		}
 		log.Warn("DistCache::uploadChunkAsync : upload failed: %v", err)
 	}
 }

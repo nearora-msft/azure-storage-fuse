@@ -211,14 +211,15 @@ func (m *mockNextComponent) TruncateFile(_ internal.TruncateFileOptions) error {
 
 func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCache {
 	dc := &DistCache{
-		client:        mock,
-		chunkSize:     16 * 1024 * 1024,
-		bypassOnError: true,
-		dirtyFiles:    make(map[string]time.Time),
-		pendingWrites: make(map[string]*pendingFile),
-		flushCancel:   make(map[string]context.CancelFunc),
-		fileVersions:  make(map[string]uint64),
-		stopCleanup:   make(chan struct{}),
+		client:            mock,
+		chunkSize:         16 * 1024 * 1024,
+		bypassOnError:     true,
+		dirtyFiles:        make(map[string]time.Time),
+		pendingWrites:     make(map[string]*pendingFile),
+		flushCancel:       make(map[string]context.CancelFunc),
+		readUploadCancels: make(map[string]*readUploadEntry),
+		fileVersions:      make(map[string]uint64),
+		stopCleanup:       make(chan struct{}),
 	}
 	dc.SetName(compName)
 	dc.SetNextComponent(next)
@@ -1053,11 +1054,12 @@ func TestCopyFromFile_DirtyPreventsStaleRead(t *testing.T) {
 		return nil
 	}
 
-	// Pre-populate L2 with stale data (for the download path)
+	// Pre-populate L2 with stale data (for the download path).
+	// CopyToFile uses DownloadWithSizePartial, so intercept that.
 	staleData := []byte("stale cached version")
-	mock.downloadFn = func(_ context.Context, _ string, _ int64, w io.Writer, _ ...dcache.DownloadOption) (*dcache.FileMetadata, error) {
-		w.Write(staleData)
-		return &dcache.FileMetadata{Size: int64(len(staleData))}, nil
+	mock.downloadPartialFn = func(_ context.Context, _ string, _ int64, w io.WriterAt, _ ...dcache.DownloadOption) ([]dcache.ChunkError, error) {
+		w.WriteAt(staleData, 0)
+		return nil, nil
 	}
 
 	// Simulate a write via CopyFromFile
@@ -1167,4 +1169,227 @@ func TestCommitData_CrossRestart_ResolvesServerGroupID(t *testing.T) {
 
 	// Local version should have been synced to server (v3) then bumped to v4
 	assert.Equal(t, uint64(4), dc.getVersion("test/file.bin"))
+}
+
+func TestReadUploadCancelled_OnCommitData(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Gate that blocks UploadChunk until context is cancelled or released
+	uploadStarted := make(chan struct{})
+	var uploadCancelled int32
+	var startedOnce int32
+
+	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
+		// Only track the first call (from the read-path uploadChunkAsync)
+		if atomic.CompareAndSwapInt32(&startedOnce, 0, 1) {
+			close(uploadStarted)
+			<-ctx.Done()
+			atomic.AddInt32(&uploadCancelled, 1)
+			return ctx.Err()
+		}
+		// Subsequent calls (from flush) just succeed
+		key := fmt.Sprintf("%s:%d", filename, offset)
+		mock.store[key] = append([]byte(nil), data...)
+		return nil
+	}
+
+	// Simulate a read-path cache miss that triggers uploadChunkAsync
+	azData := []byte("data from azure")
+	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
+		return 0, dcache.ErrNotFoundGotLock
+	}
+	next.readInBufferData = azData
+
+	buf := make([]byte, 1024)
+	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
+		Path:   "test/file.bin",
+		Offset: 0,
+		Data:   buf,
+	})
+	require.NoError(t, err)
+
+	// Wait for the uploadChunkAsync goroutine to start and block
+	<-uploadStarted
+
+	// Now commit new data — this should cancel the in-flight read upload
+	_ = dc.StageData(internal.StageDataOptions{
+		Name: "test/file.bin", Offset: 0, Data: []byte("new-data"), Id: "b0",
+	})
+	err = dc.CommitData(internal.CommitDataOptions{
+		Name: "test/file.bin",
+		List: []string{"b0"},
+	})
+	assert.NoError(t, err)
+
+	// Wait briefly for the cancellation to propagate
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCancelled),
+		"read-path uploadChunkAsync should be cancelled when CommitData arrives")
+}
+
+func TestReadUploadCancelled_OnCopyFromFile(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	// Gate that blocks UploadChunk until context is cancelled
+	uploadStarted := make(chan struct{})
+	var uploadCancelled int32
+
+	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
+		close(uploadStarted)
+		<-ctx.Done()
+		atomic.AddInt32(&uploadCancelled, 1)
+		return ctx.Err()
+	}
+
+	// Simulate a read-path cache miss that triggers uploadChunkAsync
+	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
+		return 0, dcache.ErrNotFound
+	}
+	next.readInBufferData = []byte("old file content")
+
+	buf := make([]byte, 1024)
+	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
+		Path:   "test/file.bin",
+		Offset: 0,
+		Data:   buf,
+	})
+	require.NoError(t, err)
+
+	// Wait for the uploadChunkAsync goroutine to start and block
+	<-uploadStarted
+
+	// Now write via CopyFromFile — should cancel the in-flight read upload
+	// Block populateCache so it doesn't interfere
+	mock.uploadFn = func(ctx context.Context, _ string, _ io.Reader, _ int64, _ ...dcache.UploadOption) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	wf, err := os.CreateTemp("", "dcache-cancel-*")
+	require.NoError(t, err)
+	defer os.Remove(wf.Name())
+	wf.WriteString("new content")
+	wf.Seek(0, 0)
+
+	err = dc.CopyFromFile(internal.CopyFromFileOptions{
+		Name: "test/file.bin",
+		File: wf,
+	})
+	assert.NoError(t, err)
+
+	// Wait briefly for the cancellation to propagate
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCancelled),
+		"read-path uploadChunkAsync should be cancelled when CopyFromFile arrives")
+}
+
+func TestReadUploadCancelled_OnDeleteFile(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	uploadStarted := make(chan struct{})
+	var uploadCancelled int32
+
+	mock.uploadChunkFn = func(ctx context.Context, _ string, _ int64, _ []byte) error {
+		close(uploadStarted)
+		<-ctx.Done()
+		atomic.AddInt32(&uploadCancelled, 1)
+		return ctx.Err()
+	}
+
+	// Trigger a read-path upload
+	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
+		return 0, dcache.ErrNotFoundGotLock
+	}
+	next.readInBufferData = []byte("file data")
+
+	buf := make([]byte, 1024)
+	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
+		Path:   "test/file.bin",
+		Offset: 0,
+		Data:   buf,
+	})
+	require.NoError(t, err)
+
+	<-uploadStarted
+
+	// Delete the file — should cancel read uploads
+	err = dc.DeleteFile(internal.DeleteFileOptions{Name: "test/file.bin"})
+	assert.NoError(t, err)
+
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCancelled),
+		"read-path uploadChunkAsync should be cancelled when DeleteFile arrives")
+}
+
+func TestReadUploadNotCancelled_ForDifferentFile(t *testing.T) {
+	mock := newMockDCacheClient()
+	next := &mockNextComponent{}
+	dc := newTestDistCache(mock, next)
+
+	uploadStarted := make(chan struct{})
+	uploadDone := make(chan struct{})
+	var uploadCompleted int32
+	var startedOnce int32
+
+	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
+		// Only block on the first call (from read-path uploadChunkAsync for file-a)
+		if atomic.CompareAndSwapInt32(&startedOnce, 0, 1) {
+			close(uploadStarted)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-uploadDone:
+				key := fmt.Sprintf("%s:%d", filename, offset)
+				mock.store[key] = append([]byte(nil), data...)
+				atomic.AddInt32(&uploadCompleted, 1)
+				return nil
+			}
+		}
+		// Subsequent calls (from flush for file-b) just succeed
+		key := fmt.Sprintf("%s:%d", filename, offset)
+		mock.store[key] = append([]byte(nil), data...)
+		return nil
+	}
+
+	// Trigger read-path upload for file A
+	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
+		return 0, dcache.ErrNotFoundGotLock
+	}
+	next.readInBufferData = []byte("file-a-data")
+
+	buf := make([]byte, 1024)
+	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
+		Path:   "test/file-a.bin",
+		Offset: 0,
+		Data:   buf,
+	})
+	require.NoError(t, err)
+
+	<-uploadStarted
+
+	// Write to a DIFFERENT file — should NOT cancel file-a's read upload
+	_ = dc.StageData(internal.StageDataOptions{
+		Name: "test/file-b.bin", Offset: 0, Data: []byte("data-b"), Id: "b0",
+	})
+	_ = dc.CommitData(internal.CommitDataOptions{
+		Name: "test/file-b.bin",
+		List: []string{"b0"},
+	})
+
+	// Unblock the upload for file A
+	close(uploadDone)
+	time.Sleep(50 * time.Millisecond)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCompleted),
+		"read-path upload for file-a should NOT be cancelled by write to file-b")
+	assert.Equal(t, []byte("file-a-data"), mock.store["test/file-a.bin:0"])
 }
