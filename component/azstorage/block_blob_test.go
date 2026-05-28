@@ -2980,7 +2980,7 @@ func (s *blockBlobTestSuite) TestMD5SetOnUpload() {
 			s.assert.Equal(blockblob.MaxUploadBlobBytes+1, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 
 			prop, err := s.az.storage.GetAttr(name)
@@ -3033,7 +3033,7 @@ func (s *blockBlobTestSuite) TestMD5NotSetOnUpload() {
 			s.assert.Equal(blockblob.MaxUploadBlobBytes+1, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 
 			prop, err := s.az.storage.GetAttr(name)
@@ -3081,7 +3081,7 @@ func (s *blockBlobTestSuite) TestMD5AutoSetOnUpload() {
 			s.assert.Equal(100, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 
 			prop, err := s.az.storage.GetAttr(name)
@@ -3134,7 +3134,7 @@ func (s *blockBlobTestSuite) TestInvalidateMD5PostUpload() {
 			s.assert.Equal(100, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 
 			blobClient := s.containerClient.NewBlobClient(name)
@@ -3190,7 +3190,7 @@ func (s *blockBlobTestSuite) TestValidateAutoMD5OnRead() {
 			s.assert.Equal(100, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 			_ = f.Close()
 			_ = os.Remove(name)
@@ -3246,7 +3246,7 @@ func (s *blockBlobTestSuite) TestValidateManualMD5OnRead() {
 			s.assert.Equal(blockblob.MaxUploadBlobBytes+1, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 			_ = f.Close()
 			_ = os.Remove(name)
@@ -3302,7 +3302,7 @@ func (s *blockBlobTestSuite) TestInvalidMD5OnRead() {
 			s.assert.Equal(100, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 			_ = f.Close()
 			_ = os.Remove(name)
@@ -3362,7 +3362,7 @@ func (s *blockBlobTestSuite) TestInvalidMD5OnReadNoVaildate() {
 			s.assert.Equal(100, n)
 			_, _ = f.Seek(0, 0)
 
-			err = s.az.storage.WriteFromFile(name, nil, f)
+			err = s.az.storage.WriteFromFile(name, nil, f, nil)
 			s.assert.NoError(err)
 			_ = f.Close()
 			_ = os.Remove(name)
@@ -3460,7 +3460,7 @@ func (s *blockBlobTestSuite) TestUploadBlobWithCPKEnabled() {
 	s.assert.NoError(err)
 	_, _ = f.Seek(0, 0)
 
-	err = s.az.storage.WriteFromFile(name1, nil, f)
+	err = s.az.storage.WriteFromFile(name1, nil, f, nil)
 	s.assert.NoError(err)
 
 	file := s.containerClient.NewBlobClient(name1)
