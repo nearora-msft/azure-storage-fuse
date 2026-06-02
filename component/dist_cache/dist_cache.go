@@ -299,6 +299,7 @@ func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
 	ctx := context.Background()
 
 	etag := options.Etag
+	log.Debug("DistCache::CopyToFile : %s etag=%q size=%d", options.Name, etag, options.Count)
 
 	// Try distributed cache with lock-on-miss enabled, collecting per-chunk misses
 	chunkErrors, err := dc.client.DownloadWithSizePartial(ctx, options.Name, etag, options.Count, options.File,
@@ -312,7 +313,7 @@ func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
 	}
 
 	if len(chunkErrors) == 0 {
-		log.Debug("DistCache::CopyToFile : L2 hit %s", options.Name)
+		log.Debug("DistCache::CopyToFile : L2 full hit %s etag=%q", options.Name, etag)
 		return nil
 	}
 
@@ -360,6 +361,7 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 		if err == nil && oldAttr != nil {
 			oldETag = oldAttr.ETag
 		}
+		log.Debug("DistCache::CopyFromFile : %s oldETag=%q (err=%v)", options.Name, oldETag, err)
 		// If GetAttr returns error (e.g., 404 for new file), oldETag stays empty
 	}
 
@@ -381,6 +383,7 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 
 	// Get new ETag from the commit response
 	newETag := *options.NewETag
+	log.Debug("DistCache::CopyFromFile : %s commit succeeded, oldETag=%q newETag=%q", options.Name, oldETag, newETag)
 
 	// Cancel any in-flight flush/populate from a previous write
 	dc.cancelFlush(options.Name)
@@ -394,13 +397,16 @@ func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
 	// Delete old version chunks if we had a previous ETag
 	if oldETag != "" {
 		oldGID := fileGroupID(options.Name, oldETag)
-		log.Debug("DistCache::CopyFromFile : deleting group %q for %s", string(oldGID), options.Name)
+		log.Debug("DistCache::CopyFromFile : deleting old group %q for %s", string(oldGID), options.Name)
 		if err := dc.client.DeleteGroup(context.Background(), oldGID); err != nil {
 			log.Warn("DistCache::CopyFromFile : L2 invalidation failed for %s: %v", options.Name, err)
 		}
+	} else {
+		log.Debug("DistCache::CopyFromFile : %s no old ETag (new file), skipping DeleteGroup", options.Name)
 	}
 
 	// Populate distributed cache (best-effort, async) with new ETag
+	log.Debug("DistCache::CopyFromFile : populating L2 for %s with newETag=%q", options.Name, newETag)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	dc.flushMu.Lock()
 	dc.flushCancel[options.Name] = cancel
@@ -438,13 +444,14 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
 
 	// Resolve ETag from handle (pinned at open time by block_cache)
 	etag := resolveETag(options)
+	log.Debug("DistCache::ReadInBuffer : %s offset=%d etag=%q", name, options.Offset, etag)
 
 	ctx := context.Background()
 
 	n, err := dc.client.DownloadChunk(ctx, name, etag, options.Offset, options.Data,
 		dcache.WithLock(true))
 	if err == nil && n > 0 {
-		log.Debug("DistCache::ReadInBuffer : L2 hit %s offset=%d", name, options.Offset)
+		log.Debug("DistCache::ReadInBuffer : L2 hit %s offset=%d etag=%q", name, options.Offset, etag)
 		return n, nil
 	}
 	if err == nil && n == 0 {
@@ -577,6 +584,7 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 		if err == nil && oldAttr != nil {
 			oldETag = oldAttr.ETag
 		}
+		log.Debug("DistCache::CommitData : %s oldETag=%q (err=%v)", options.Name, oldETag, err)
 		// If GetAttr returns error (e.g., 404 for new file), oldETag stays empty
 	}
 
@@ -595,6 +603,7 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	if options.NewETag != nil {
 		newETag = *options.NewETag
 	}
+	log.Debug("DistCache::CommitData : %s commit succeeded, oldETag=%q newETag=%q", options.Name, oldETag, newETag)
 
 	// Cancel any in-flight flush from a previous commit. This prevents a racing
 	// goroutine from uploading stale chunks after our DeleteGroup below.
@@ -608,10 +617,12 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	// Delete old version chunks if we had a previous ETag
 	if oldETag != "" {
 		oldGID := fileGroupID(options.Name, oldETag)
-		log.Debug("DistCache::CommitData : deleting group %q for %s", string(oldGID), options.Name)
+		log.Debug("DistCache::CommitData : deleting old group %q for %s", string(oldGID), options.Name)
 		if err := dc.client.DeleteGroup(context.Background(), oldGID); err != nil {
 			log.Warn("DistCache::CommitData : L2 invalidation failed for %s: %v", options.Name, err)
 		}
+	} else {
+		log.Debug("DistCache::CommitData : %s no old ETag (new file), skipping DeleteGroup", options.Name)
 	}
 
 	// Drain pending chunks and flush to L2 asynchronously now that the
@@ -622,6 +633,7 @@ func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
 	dc.pendingMu.Unlock()
 
 	if pf != nil && len(pf.chunks) > 0 {
+		log.Debug("DistCache::CommitData : flushing %d pending chunks to L2 for %s with newETag=%q", len(pf.chunks), options.Name, newETag)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		dc.flushMu.Lock()
 		dc.flushCancel[options.Name] = cancel
@@ -639,6 +651,7 @@ func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
 		dc.markDirty(options.Name)
 		dc.clearPending(options.Name)
 		etag := dc.resolveRemoteETag(options.Name)
+		log.Debug("DistCache::DeleteFile : %s resolvedETag=%q", options.Name, etag)
 		if etag != "" {
 			gid := fileGroupID(options.Name, etag)
 			log.Debug("DistCache::DeleteFile : deleting group %q for %s", string(gid), options.Name)
@@ -656,6 +669,7 @@ func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
 		dc.markDirty(options.Src)
 		dc.clearPending(options.Src)
 		etag := dc.resolveRemoteETag(options.Src)
+		log.Debug("DistCache::RenameFile : %s -> %s resolvedETag=%q", options.Src, options.Dst, etag)
 		if etag != "" {
 			gid := fileGroupID(options.Src, etag)
 			log.Debug("DistCache::RenameFile : deleting group %q for %s", string(gid), options.Src)
@@ -673,6 +687,7 @@ func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
 		dc.markDirty(options.Name)
 		dc.clearPending(options.Name)
 		etag := dc.resolveRemoteETag(options.Name)
+		log.Debug("DistCache::TruncateFile : %s resolvedETag=%q", options.Name, etag)
 		if etag != "" {
 			gid := fileGroupID(options.Name, etag)
 			log.Debug("DistCache::TruncateFile : deleting group %q for %s", string(gid), options.Name)
@@ -817,16 +832,17 @@ func (dc *DistCache) resolveRemoteETag(name string) string {
 // resolveETag extracts the ETag from a ReadInBufferOptions, preferring the
 // handle's stored value (pinned at open time by block_cache).
 func resolveETag(options *internal.ReadInBufferOptions) string {
-	if options.Etag != nil {
+	if options.Etag != nil && *options.Etag != "" {
 		return *options.Etag
 	}
 	if options.Handle != nil {
 		if v, ok := options.Handle.GetValue("ETAG"); ok {
-			if etag, ok := v.(string); ok {
+			if etag, ok := v.(string); ok && etag != "" {
 				return etag
 			}
 		}
 	}
+	log.Debug("DistCache::resolveETag : no etag found (Etag field nil/empty, handle missing or no ETAG key)")
 	return ""
 }
 
