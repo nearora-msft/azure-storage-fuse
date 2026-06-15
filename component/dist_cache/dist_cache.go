@@ -24,7 +24,7 @@ const compName = "dist_cache"
 
 // maxParallelChunkOps limits the number of concurrent chunk-level recovery
 // operations (Azure fetches and cache polls) during CopyToFile.
-const maxParallelChunkOps = 8
+const maxParallelChunkOps = 32
 
 // maxPendingL2Uploads limits the number of concurrent L2 cache uploads when
 // flushing pending chunks at commit time.
@@ -323,14 +323,14 @@ func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
 
 	for _, ce := range chunkErrors {
 		ce := ce
-		switch ce.Err {
-		case dcache.ErrNotFoundGotLock:
+		switch {
+		case ce.Err == dcache.ErrNotFoundGotLock:
 			g.Go(func() error {
 				log.Debug("DistCache::CopyToFile : L2 chunk miss (got lock) %s offset=%d", options.Name, ce.Offset)
 				return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, true)
 			})
 
-		case dcache.ErrNotFoundAlreadyLocked:
+		case ce.Err == dcache.ErrNotFoundAlreadyLocked:
 			g.Go(func() error {
 				log.Debug("DistCache::CopyToFile : L2 chunk miss (locked) %s offset=%d, polling", options.Name, ce.Offset)
 				if err := dc.pollUntilChunkCached(gctx, options, ce.Offset, ce.Size); err != nil {
@@ -338,6 +338,12 @@ func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
 					return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, false)
 				}
 				return nil
+			})
+
+		case dcache.IsRecoverableNetErr(ce.Err):
+			g.Go(func() error {
+				log.Warn("DistCache::CopyToFile : L2 chunk network error %s offset=%d err=%v, fetching from storage", options.Name, ce.Offset, ce.Err)
+				return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, false)
 			})
 
 		default:
