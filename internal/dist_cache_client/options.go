@@ -27,7 +27,6 @@ type clientConfig struct {
 	port             int
 	authAccountName  string
 	authAccountKey   string
-	hashType         string
 	chunkSize        int64
 	cachePrefix      string
 	maxConnsPerSvr   int
@@ -42,7 +41,6 @@ type clientConfig struct {
 func defaultConfig() *clientConfig {
 	return &clientConfig{
 		port:             defaultPort,
-		hashType:         "consistent",
 		chunkSize:        defaultChunkSize,
 		maxConnsPerSvr:   defaultMaxConnsPerSvr,
 		dialTimeout:      defaultDialTimeout,
