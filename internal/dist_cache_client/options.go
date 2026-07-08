@@ -25,8 +25,6 @@ type clientConfig struct {
 	k8sService       string
 	k8sNamespace     string
 	port             int
-	authAccountName  string
-	authAccountKey   string
 	chunkSize        int64
 	cachePrefix      string
 	maxConnsPerSvr   int
@@ -76,14 +74,6 @@ func WithK8sDiscovery(service, namespace string) Option {
 // WithPort sets the server port (default 9000).
 func WithPort(port int) Option {
 	return func(c *clientConfig) { c.port = port }
-}
-
-// WithAuth configures authentication credentials.
-func WithAuth(accountName, accountKey string) Option {
-	return func(c *clientConfig) {
-		c.authAccountName = accountName
-		c.authAccountKey = accountKey
-	}
 }
 
 // WithChunkSize sets the chunk size in bytes (default 32 MiB).

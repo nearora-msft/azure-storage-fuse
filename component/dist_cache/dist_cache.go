@@ -56,8 +56,6 @@ type DistCacheOptions struct {
 	Port            int    `config:"port"              yaml:"port,omitempty"`
 	TTLSeconds      uint32 `config:"ttl-seconds"       yaml:"ttl-seconds,omitempty"`
 	MaxFileSizeMB   int    `config:"max-file-size-mb"  yaml:"max-file-size-mb,omitempty"`
-	AuthAccountName string `config:"auth-account-name" yaml:"auth-account-name,omitempty"`
-	AuthAccountKey  string `config:"auth-account-key"  yaml:"auth-account-key,omitempty"`
 	BypassOnError   bool   `config:"bypass-on-error"   yaml:"bypass-on-error,omitempty"`
 	CachePrefix     string `config:"cache-prefix"      yaml:"cache-prefix,omitempty"`
 	MaxConnsPerSvr  int    `config:"max-conns-per-server" yaml:"max-conns-per-server,omitempty"`
@@ -262,10 +260,16 @@ func (dc *DistCache) Start(ctx context.Context) error {
 	if dc.conf.Port > 0 {
 		opts = append(opts, dcache.WithPort(dc.conf.Port))
 	}
+<<<<<<< HEAD
 	if dc.conf.AuthAccountName != "" {
 		opts = append(opts, dcache.WithAuth(dc.conf.AuthAccountName, dc.conf.AuthAccountKey))
 	}
 	opts = append(opts, dcache.WithCachePrefix(dc.cachePrefix))
+=======
+	if dc.conf.CachePrefix != "" {
+		opts = append(opts, dcache.WithCachePrefix(dc.conf.CachePrefix))
+	}
+>>>>>>> b18ad5143 (Remove auth related params)
 	if dc.conf.MaxConnsPerSvr > 0 {
 		opts = append(opts, dcache.WithMaxConnsPerServer(dc.conf.MaxConnsPerSvr))
 	}
