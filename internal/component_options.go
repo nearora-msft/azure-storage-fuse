@@ -140,14 +140,12 @@ type CopyToFileOptions struct {
 	Offset int64
 	Count  int64
 	File   *os.File
-	Etag   string // ETag pinned at open time for versioned cache lookups
 }
 
 type CopyFromFileOptions struct {
 	Name     string
 	File     *os.File
 	Metadata map[string]*string
-	NewETag  *string // populated by azstorage after successful upload
 }
 
 type FlushFileOptions struct {

@@ -6,7 +6,6 @@ package dist_cache
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
@@ -21,10 +20,6 @@ import (
 )
 
 const compName = "dist_cache"
-
-// maxParallelChunkOps limits the number of concurrent chunk-level recovery
-// operations (Azure fetches and cache polls) during CopyToFile.
-const maxParallelChunkOps = 8
 
 // maxPendingL2Uploads limits the number of concurrent L2 cache uploads when
 // flushing pending chunks at commit time.
@@ -62,7 +57,6 @@ type DistCacheOptions struct {
 
 	// Chunk size for distributed cache operations. When block_cache is present,
 	// this is overridden by block_cache.block-size-mb to keep alignment consistent.
-	// When used with file_cache (no block_cache), this is the primary chunk size config.
 	ChunkSizeMB float64 `config:"chunk-size-mb" yaml:"chunk-size-mb,omitempty"`
 }
 
@@ -132,8 +126,6 @@ const dirtyTTL = 10 * time.Second
 
 // dcacheClient abstracts the distributed cache client for testing.
 type dcacheClient interface {
-	Upload(ctx context.Context, filename, etag string, data io.Reader, size int64, opts ...dcache.UploadOption) error
-	DownloadWithSizePartial(ctx context.Context, filename, etag string, fileSize int64, w io.WriterAt, opts ...dcache.DownloadOption) (<-chan dcache.ChunkError, func() error, error)
 	DownloadChunk(ctx context.Context, filename, etag string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
 	UploadChunk(ctx context.Context, filename, etag string, offset int64, data []byte, opts ...dcache.UploadOption) error
 	Delete(ctx context.Context, filename string, fileSize int64) error
@@ -334,180 +326,15 @@ func (dc *DistCache) Priority() internal.ComponentPriority {
 	return internal.EComponentPriority.LevelMid()
 }
 
-// --- Read path (file_cache) ---
-
-func (dc *DistCache) CopyToFile(options internal.CopyToFileOptions) error {
-	if dc.client == nil {
-		return dc.NextComponent().CopyToFile(options)
-	}
-
-	// Skip dist_cache for recently invalidated files to avoid stale data
-	if dc.isDirty(options.Name) {
-		log.Debug("DistCache::CopyToFile : dirty, bypassing %s", options.Name)
-		return dc.NextComponent().CopyToFile(options)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	etag := options.Etag
-	log.Debug("DistCache::CopyToFile : %s etag=%q size=%d", options.Name, etag, options.Count)
-
-	// Try distributed cache with lock-on-miss enabled, collecting per-chunk misses
-	chunkErrCh, wait, err := dc.client.DownloadWithSizePartial(ctx, options.Name, etag, options.Count, options.File, dcache.WithLock(true))
-	if err != nil {
-		if dc.bypassOnError {
-			log.Warn("DistCache::CopyToFile : error, bypassing: %v", err)
-			return dc.NextComponent().CopyToFile(options)
-		}
-		return err
-	}
-
-	// Handle chunk misses in parallel as they arrive from the channel,
-	// concurrently with remaining downloads still in flight.
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(maxParallelChunkOps)
-
-	readerDone := make(chan struct{})
-	go func() {
-		defer close(readerDone)
-		for ce := range chunkErrCh {
-			ce := ce
-			switch {
-			case ce.Err == dcache.ErrNotFoundGotLock:
-				g.Go(func() error {
-					log.Debug("DistCache::CopyToFile : L2 chunk miss (got lock) %s offset=%d", options.Name, ce.Offset)
-					return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, true)
-				})
-
-			case ce.Err == dcache.ErrNotFoundAlreadyLocked:
-				g.Go(func() error {
-					log.Debug("DistCache::CopyToFile : L2 chunk miss (locked) %s offset=%d, polling", options.Name, ce.Offset)
-					if err := dc.pollUntilChunkCached(gctx, options, ce.Offset, ce.Size); err != nil {
-						log.Debug("DistCache::CopyToFile : chunk poll timeout %s offset=%d, falling through", options.Name, ce.Offset)
-						return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, false)
-					}
-					return nil
-				})
-
-			case dcache.IsRecoverableNetErr(ce.Err):
-				g.Go(func() error {
-					log.Warn("DistCache::CopyToFile : L2 chunk network error %s offset=%d err=%v, fetching from storage", options.Name, ce.Offset, ce.Err)
-					return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, false)
-				})
-
-			default:
-				g.Go(func() error {
-					log.Debug("DistCache::CopyToFile : L2 chunk miss %s offset=%d", options.Name, ce.Offset)
-					return dc.fetchChunkFromRemote(gctx, options, ce.Offset, ce.Size, false)
-				})
-			}
-		}
-	}()
-
-	// Wait for all cache downloads to finish (closes chunkErrCh)
-	if fatalErr := wait(); fatalErr != nil {
-		cancel() // cancel recovery goroutines
-		<-readerDone
-		_ = g.Wait() // drain in-flight recovery work before returning
-		if dc.bypassOnError {
-			log.Warn("DistCache::CopyToFile : fatal download error, bypassing: %v", fatalErr)
-			return dc.NextComponent().CopyToFile(options)
-		}
-		return fatalErr
-	}
-
-	// Wait for channel reader to finish queueing all recovery work
-	<-readerDone
-
-	// Wait for all miss recovery operations to finish
-	if err := g.Wait(); err != nil {
-		return err
-	}
-
-	log.Debug("DistCache::CopyToFile : completed %s", options.Name)
-	return nil
-}
-
-// --- Write path (file_cache) ---
-
-func (dc *DistCache) CopyFromFile(options internal.CopyFromFileOptions) error {
-	// Resolve old ETag from remote blob BEFORE commit overwrites it
-	var oldETag string
-	if dc.client != nil {
-		oldAttr, err := dc.NextComponent().GetAttr(internal.GetAttrOptions{Name: options.Name})
-		if err == nil && oldAttr != nil {
-			oldETag = oldAttr.ETag
-		}
-		log.Debug("DistCache::CopyFromFile : %s oldETag=%q (err=%v)", options.Name, oldETag, err)
-		// If GetAttr returns error (e.g., 404 for new file), oldETag stays empty
-	}
-
-	// Provide a pointer for azstorage to write the new ETag into
-	var newETagStr string
-	if options.NewETag == nil {
-		options.NewETag = &newETagStr
-	}
-
-	// Write-through to azstorage first (source of truth)
-	err := dc.NextComponent().CopyFromFile(options)
-	if err != nil {
-		return err
-	}
-
-	if dc.client == nil {
-		return nil
-	}
-
-	// Get new ETag from the commit response
-	newETag := *options.NewETag
-	log.Debug("DistCache::CopyFromFile : %s commit succeeded, oldETag=%q newETag=%q", options.Name, oldETag, newETag)
-
-	// Cancel any in-flight flush/populate from a previous write
-	dc.cancelFlush(options.Name)
-
-	// Cancel any in-flight read-path uploads that may overwrite our fresh data
-	dc.cancelReadUploads(options.Name)
-
-	// Mark dirty so other nodes bypass stale L2 data during the populate window
-	dc.markDirty(options.Name)
-
-	// Delete old version chunks if we had a previous ETag
-	if oldETag != "" {
-		oldGID := fileGroupID(options.Name, oldETag)
-		log.Debug("DistCache::CopyFromFile : deleting old group %q for %s", string(oldGID), options.Name)
-		if err := dc.client.DeleteGroup(context.Background(), oldGID); err != nil {
-			log.Warn("DistCache::CopyFromFile : L2 invalidation failed for %s: %v", options.Name, err)
-		}
-	} else {
-		log.Debug("DistCache::CopyFromFile : %s no old ETag (new file), skipping DeleteGroup", options.Name)
-	}
-
-	// Populate distributed cache (best-effort, async) with new ETag
-	log.Debug("DistCache::CopyFromFile : populating L2 for %s with newETag=%q", options.Name, newETag)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	dc.flushMu.Lock()
-	dc.flushCancel[options.Name] = cancel
-	dc.flushMu.Unlock()
-	go func() {
-		defer cancel() // release timer resources on the success path
-		dc.populateCache(ctx, options.Name, options.File.Name(), newETag)
-	}()
-	return nil
-}
-
-// --- Read path (block_cache) ---
+// --- Read path ---
 
 // resolveReadPath returns the file path for a ReadInBuffer call. block_cache
-// sets Handle but not Path; file_cache/azstorage may set Path directly.
+// sets Handle but not Path.
 func resolveReadPath(options *internal.ReadInBufferOptions) string {
-	if options.Path != "" {
-		return options.Path
-	}
 	if options.Handle != nil {
 		return options.Handle.Path
 	}
-	return ""
+	return options.Path
 }
 
 func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, error) {
@@ -601,7 +428,7 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
 	return 0, err
 }
 
-// --- Write path (block_cache) ---
+// --- Write path ---
 
 func (dc *DistCache) StageData(options internal.StageDataOptions) error {
 	// Write-through to azstorage first
@@ -798,56 +625,6 @@ func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
 }
 
 // --- Internal helpers ---
-
-// fetchChunkFromRemote downloads a single chunk from Azure via the next component
-// and writes it to the file at the correct offset. If populateCache is true,
-// the chunk is also uploaded to the distributed cache asynchronously.
-func (dc *DistCache) fetchChunkFromRemote(ctx context.Context, options internal.CopyToFileOptions, offset, size int64, populateCache bool) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	default:
-	}
-
-	buf := dc.getBuf(int(size))
-	readOpts := &internal.ReadInBufferOptions{
-		Path:   options.Name,
-		Offset: offset,
-		Data:   buf,
-		Size:   options.Count,
-	}
-	n, err := dc.NextComponent().ReadInBuffer(readOpts)
-	if err != nil {
-		dc.putBuf(buf)
-		return err
-	}
-	if _, err := options.File.WriteAt(buf[:n], offset); err != nil {
-		dc.putBuf(buf)
-		return err
-	}
-	if populateCache {
-		// Transfer buffer ownership to the upload goroutine; uploadChunkAsync
-		// returns it to the pool via its deferred putBuf.
-		uploadCtx := dc.getReadUploadCtx(options.Name)
-		go dc.uploadChunkAsync(uploadCtx, options.Name, options.Etag, offset, buf[:n])
-	} else {
-		dc.putBuf(buf)
-	}
-	return nil
-}
-
-// pollUntilChunkCached waits for a single chunk to become available in the
-// distributed cache and writes it to the file. Returns nil on success.
-func (dc *DistCache) pollUntilChunkCached(ctx context.Context, options internal.CopyToFileOptions, offset, size int64) error {
-	buf := dc.getBuf(int(size))
-	defer dc.putBuf(buf)
-	n, err := dc.pollChunkIntoBuffer(ctx, options.Name, options.Etag, offset, buf)
-	if err != nil {
-		return err
-	}
-	_, err = options.File.WriteAt(buf[:n], offset)
-	return err
-}
 
 // pollChunkIntoBuffer waits for a single chunk to become available in the
 // distributed cache and copies it into buf. Returns the number of bytes read.
@@ -1094,50 +871,6 @@ func (dc *DistCache) evictStalePending() {
 		}
 	}
 	dc.pendingMu.Unlock()
-}
-
-func (dc *DistCache) populateCache(ctx context.Context, name string, filePath string, etag string) {
-	defer func() {
-		dc.flushMu.Lock()
-		delete(dc.flushCancel, name)
-		dc.flushMu.Unlock()
-	}()
-
-	// Re-open the file by path (the original handle may be closed by the caller)
-	f, err := os.Open(filePath)
-	if err != nil {
-		log.Warn("DistCache::populateCache : open failed: %v", err)
-		return
-	}
-	defer f.Close()
-
-	// Get file size
-	info, err := f.Stat()
-	if err != nil {
-		log.Warn("DistCache::populateCache : stat failed: %v", err)
-		return
-	}
-
-	gid := fileGroupID(name, etag)
-	log.Debug("DistCache::populateCache : uploading %s (size=%d) with group %q", name, info.Size(), string(gid))
-	opts := []dcache.UploadOption{
-		dcache.WithIgnoreLock(true),
-		dcache.WithGroupID(gid),
-		dcache.WithMetadata(map[string][]byte{"gid": gid}),
-	}
-	if dc.conf.TTLSeconds > 0 {
-		opts = append(opts, dcache.WithTTL(dc.conf.TTLSeconds))
-	}
-
-	if err := dc.client.Upload(ctx, name, etag, f, info.Size(), opts...); err != nil {
-		log.Warn("DistCache::populateCache : upload failed: %v", err)
-		return
-	}
-
-	// Only clear dirty if we weren't cancelled
-	if ctx.Err() == nil {
-		dc.clearDirty(name)
-	}
 }
 
 // readUploadEntry holds a shared context for read-path uploads on a single file.

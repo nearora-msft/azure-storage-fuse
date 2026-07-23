@@ -45,7 +45,7 @@ file_cache:
 
 # Distributed cache configuration (optional, for multi-node shared caching)
 # Requires a running Tachyon cache server cluster (https://github.com/Azure/Tachyon).
-# Requires block_cache or file_cache in the pipeline. Mutually exclusive with xload.
+# Requires block_cache in the pipeline. Mutually exclusive with xload and file_cache.
 dist_cache:
   # Server discovery — at least one method must be configured
   # Precedence order for server discovery: discovery-url > k8s DNS > server-list, lower-precedence entries will only be used as a fallback
@@ -59,7 +59,7 @@ dist_cache:
   port: <cache server port. Default - 9065>
   bypass-on-error: <if true, cache errors fall through to Azure Blob Storage. Default - false>
   ttl-seconds: <TTL for cached data in seconds. Default - 0 (no expiry)>
-  chunk-size-mb: <chunk size in MB, used when block_cache is not present. Default - 16>
+  chunk-size-mb: <chunk size in MB, aligned with block_cache block-size-mb. Default - 16>
   cache-prefix: <prefix for cache keys. Default - derived from azstorage account/container>
   max-conns-per-server: <maximum TCP connections per cache server. Default - 8>
   request-timeout-sec: <timeout for individual cache requests in seconds. Default - 30>

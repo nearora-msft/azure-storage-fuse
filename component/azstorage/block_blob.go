@@ -1061,7 +1061,7 @@ func trackUpload(name string, bytesTransferred int64, count int64, uploadPtr *in
 }
 
 // WriteFromFile : Upload local file to blob
-func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi *os.File, newEtag *string) (err error) {
+func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi *os.File) (err error) {
 	log.Trace("BlockBlob::WriteFromFile : name %s", name)
 	//defer exectime.StatTimeCurrentBlock("WriteFromFile::WriteFromFile")()
 
@@ -1117,7 +1117,7 @@ func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi 
 		}
 	}
 
-	resp, err := blobClient.UploadFile(context.Background(), fi, uploadOptions)
+	_, err = blobClient.UploadFile(context.Background(), fi, uploadOptions)
 
 	if err != nil {
 		serr := storeBlobErrToErr(err)
@@ -1134,10 +1134,6 @@ func (bb *BlockBlob) WriteFromFile(name string, metadata map[string]*string, fi 
 		return err
 	} else {
 		log.Debug("BlockBlob::WriteFromFile : Upload complete of blob %v", name)
-
-		if newEtag != nil {
-			*newEtag = sanitizeEtag(resp.ETag)
-		}
 
 		// store total bytes uploaded so far
 		if stat.Size() > 0 {
