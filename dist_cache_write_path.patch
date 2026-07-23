@@ -1,0 +1,1618 @@
+diff --git a/component/dist_cache/dist_cache.go b/component/dist_cache/dist_cache.go
+index 0ba53ab5c..83b221071 100644
+--- a/component/dist_cache/dist_cache.go
++++ b/component/dist_cache/dist_cache.go
+@@ -16,12 +16,23 @@ import (
+ 	"github.com/Azure/azure-storage-fuse/v2/internal"
+ 
+ 	dcache "github.com/nearora-msft/dist-cache-client-go"
++	"golang.org/x/sync/errgroup"
+ )
+ 
+ const compName = "dist_cache"
+ 
+-// readUploadTimeout bounds a single async L2 populate goroutine kicked off from the read path.
+-const readUploadTimeout = 60 * time.Second
++// maxPendingL2Uploads limits the number of concurrent L2 cache uploads when
++// flushing pending chunks at commit time.
++const maxPendingL2Uploads = 8
++
++// pendingWriteTTL is the maximum time pending chunks are held before being
++// evicted. This handles abandoned writes (e.g., process crash before commit,
++// lazy-write with long-lived handles).
++const pendingWriteTTL = 5 * time.Minute
++
++// pendingCleanupInterval is how often the background goroutine scans for
++// expired pending entries.
++const pendingCleanupInterval = 30 * time.Second
+ 
+ // DistCacheOptions holds configuration for the distributed cache component.
+ type DistCacheOptions struct {
+@@ -39,6 +50,7 @@ type DistCacheOptions struct {
+ 	// Common options
+ 	Port           int    `config:"port"              yaml:"port,omitempty"`
+ 	TTLSeconds     uint32 `config:"ttl-seconds"       yaml:"ttl-seconds,omitempty"`
++	MaxFileSizeMB  int    `config:"max-file-size-mb"  yaml:"max-file-size-mb,omitempty"`
+ 	BypassOnError  bool   `config:"bypass-on-error"   yaml:"bypass-on-error,omitempty"`
+ 	CachePrefix    string `config:"cache-prefix"      yaml:"cache-prefix,omitempty"`
+ 	MaxConnsPerSvr int    `config:"max-conns-per-server" yaml:"max-conns-per-server,omitempty"`
+@@ -48,6 +60,20 @@ type DistCacheOptions struct {
+ 	ChunkSizeMB float64 `config:"chunk-size-mb" yaml:"chunk-size-mb,omitempty"`
+ }
+ 
++// pendingChunk holds a staged chunk's data until the file is committed.
++type pendingChunk struct {
++	offset int64
++	data   []byte
++}
++
++// pendingFile tracks buffered chunks for a single file along with metadata
++// for size-cap and TTL-based eviction.
++type pendingFile struct {
++	chunks       []pendingChunk
++	totalSize    int64     // sum of len(chunk.data) for all chunks
++	lastActivity time.Time // updated on each StageData; used for TTL eviction
++}
++
+ // DistCache is the blobfuse component that sits between the local cache and azstorage,
+ // providing a shared distributed cache layer across nodes.
+ type DistCache struct {
+@@ -59,18 +85,54 @@ type DistCache struct {
+ 	cachePrefix   string
+ 	bypassOnError bool
+ 
+-	// chunkPool recycles chunk-sized byte buffers used on the read hot path to
+-	// avoid per-operation allocations. Buffers returned from getBuf have
+-	// capacity == chunkSize; callers slice down to the length they need and
+-	// must return the buffer via putBuf when ownership ends. Requests larger
+-	// than chunkSize bypass the pool.
++	// dirtyFiles tracks recently invalidated files to avoid serving stale data.
++	// After a delete/truncate/rename, the file is added here. Reads for files
++	// in this set bypass dist_cache until the TTL expires, giving the server
++	// time to process the async group-based deletion.
++	dirtyMu    sync.Mutex
++	dirtyFiles map[string]time.Time
++
++	// pendingMu protects pendingWrites. Chunks are buffered here during
++	// StageData and flushed to L2 only after CommitData succeeds, preventing
++	// other nodes from reading partially-written data.
++	pendingMu     sync.Mutex
++	pendingWrites map[string]*pendingFile
++
++	// flushMu protects flushCancel. When a new commit or invalidation arrives
++	// for a file, any in-flight flush goroutine for that file is cancelled to
++	// prevent it from uploading stale data after a DeleteGroup.
++	flushMu     sync.Mutex
++	flushCancel map[string]context.CancelFunc
++
++	// readUploadMu protects readUploadCancels. Read-path uploadChunkAsync
++	// goroutines share a per-file context so they can be cancelled when a
++	// write/invalidation arrives, preventing stale data from overwriting
++	// freshly flushed chunks.
++	readUploadMu      sync.Mutex
++	readUploadCancels map[string]*readUploadEntry
++
++	// stopCleanup signals the background pending-writes cleanup goroutine to exit.
++	stopCleanup chan struct{}
++
++	// chunkPool recycles chunk-sized byte buffers used on the read/write hot
++	// paths to avoid per-operation allocations. Buffers returned from getBuf
++	// have capacity == chunkSize; callers slice down to the length they need
++	// and must return the buffer via putBuf when ownership ends. Requests
++	// larger than chunkSize bypass the pool.
+ 	chunkPool sync.Pool
+ }
+ 
++const dirtyTTL = 10 * time.Second
++
+ // dcacheClient abstracts the distributed cache client for testing.
+ type dcacheClient interface {
+ 	DownloadChunk(ctx context.Context, filename, etag string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
+ 	UploadChunk(ctx context.Context, filename, etag string, offset int64, data []byte, opts ...dcache.UploadOption) error
++	Delete(ctx context.Context, filename string, fileSize int64) error
++	DeleteGroup(ctx context.Context, groupID []byte) error
++	GetChunkGroupID(ctx context.Context, filename, etag string) ([]byte, error)
++	GetAttr(ctx context.Context, filename string) (*dcache.FileAttr, error)
++	PutAttr(ctx context.Context, attrs []dcache.FileAttrEntry) error
+ 	Close() error
+ }
+ 
+@@ -78,7 +140,13 @@ type dcacheClient interface {
+ var _ internal.Component = &DistCache{}
+ 
+ func NewDistCacheComponent() internal.Component {
+-	comp := &DistCache{}
++	comp := &DistCache{
++		dirtyFiles:        make(map[string]time.Time),
++		pendingWrites:     make(map[string]*pendingFile),
++		flushCancel:       make(map[string]context.CancelFunc),
++		readUploadCancels: make(map[string]*readUploadEntry),
++		stopCleanup:       make(chan struct{}),
++	}
+ 	comp.SetName(compName)
+ 	return comp
+ }
+@@ -239,11 +307,15 @@ func (dc *DistCache) Start(ctx context.Context) error {
+ 	dc.client = client
+ 	log.Info("DistCache::Start : connected to distributed cache cluster")
+ 
++	// Start background goroutine to evict stale pending writes
++	go dc.pendingCleanupLoop()
++
+ 	return nil
+ }
+ 
+ func (dc *DistCache) Stop() error {
+ 	log.Trace("Stopping component : %s", dc.Name())
++	close(dc.stopCleanup)
+ 	if dc.client != nil {
+ 		return dc.client.Close()
+ 	}
+@@ -272,6 +344,12 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
+ 
+ 	name := resolveReadPath(options)
+ 
++	// Skip dist_cache for recently invalidated files to avoid stale data
++	if dc.isDirty(name) {
++		log.Debug("DistCache::ReadInBuffer : dirty, bypassing %s", name)
++		return dc.NextComponent().ReadInBuffer(options)
++	}
++
+ 	// Resolve ETag from handle (pinned at open time by block_cache)
+ 	etag := resolveETag(options)
+ 	log.Debug("DistCache::ReadInBuffer : %s offset=%d etag=%q", name, options.Offset, etag)
+@@ -294,11 +372,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
+ 		if n > 0 {
+ 			dataCopy := dc.getBuf(n)
+ 			copy(dataCopy, options.Data[:n])
+-			uploadCtx, cancel := context.WithTimeout(context.Background(), readUploadTimeout)
+-			go func() {
+-				defer cancel()
+-				dc.uploadChunkAsync(uploadCtx, name, etag, options.Offset, dataCopy)
+-			}()
++			uploadCtx := dc.getReadUploadCtx(name)
++			go dc.uploadChunkAsync(uploadCtx, name, etag, options.Offset, dataCopy)
+ 		}
+ 		return n, nil
+ 	}
+@@ -312,11 +387,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
+ 		}
+ 		dataCopy := dc.getBuf(n)
+ 		copy(dataCopy, options.Data[:n])
+-		uploadCtx, cancel := context.WithTimeout(context.Background(), readUploadTimeout)
+-		go func() {
+-			defer cancel()
+-			dc.uploadChunkAsync(uploadCtx, name, etag, options.Offset, dataCopy)
+-		}()
++		uploadCtx := dc.getReadUploadCtx(name)
++		go dc.uploadChunkAsync(uploadCtx, name, etag, options.Offset, dataCopy)
+ 		return n, nil
+ 	}
+ 
+@@ -335,11 +407,8 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
+ 		}
+ 		dataCopy := dc.getBuf(n)
+ 		copy(dataCopy, options.Data[:n])
+-		uploadCtx, cancel := context.WithTimeout(context.Background(), readUploadTimeout)
+-		go func() {
+-			defer cancel()
+-			dc.uploadChunkAsync(uploadCtx, name, etag, options.Offset, dataCopy)
+-		}()
++		uploadCtx := dc.getReadUploadCtx(name)
++		go dc.uploadChunkAsync(uploadCtx, name, etag, options.Offset, dataCopy)
+ 		return n, nil
+ 	}
+ 
+@@ -359,6 +428,202 @@ func (dc *DistCache) ReadInBuffer(options *internal.ReadInBufferOptions) (int, e
+ 	return 0, err
+ }
+ 
++// --- Write path ---
++
++func (dc *DistCache) StageData(options internal.StageDataOptions) error {
++	// Write-through to azstorage first
++	err := dc.NextComponent().StageData(options)
++	if err != nil {
++		return err
++	}
++
++	if dc.client == nil {
++		return nil
++	}
++
++	dataLen := int64(len(options.Data))
++	maxSize := int64(dc.conf.MaxFileSizeMB) * 1024 * 1024
++
++	dataCopy := dc.getBuf(int(dataLen))
++	copy(dataCopy, options.Data)
++
++	dc.pendingMu.Lock()
++	pf := dc.pendingWrites[options.Name]
++
++	// Size cap: if buffering this chunk would exceed MaxFileSizeMB, drop all
++	// pending data for this file. L2 will be warmed via the read path instead.
++	// No need to invalidate L2 here — the committed state hasn't changed, so
++	// existing L2 data is still valid. CommitData will handle invalidation if
++	// and when the write is actually committed.
++	pendingSize := dataLen
++	if pf != nil {
++		pendingSize = pf.totalSize + dataLen
++	}
++	if maxSize > 0 && pendingSize > maxSize {
++		log.Debug("DistCache::StageData : pending size would exceed %dMB for %s, skipping L2 write-warming",
++			dc.conf.MaxFileSizeMB, options.Name)
++		delete(dc.pendingWrites, options.Name)
++		dc.pendingMu.Unlock()
++		// Return the dropped buffer and any prior pending buffers to the pool.
++		dc.putBuf(dataCopy)
++		if pf != nil {
++			for _, c := range pf.chunks {
++				dc.putBuf(c.data)
++			}
++		}
++		return nil
++	}
++
++	if pf == nil {
++		pf = &pendingFile{}
++		dc.pendingWrites[options.Name] = pf
++	}
++	pf.chunks = append(pf.chunks, pendingChunk{
++		offset: int64(options.Offset),
++		data:   dataCopy,
++	})
++	pf.totalSize += dataLen
++	pf.lastActivity = time.Now()
++	dc.pendingMu.Unlock()
++
++	return nil
++}
++
++func (dc *DistCache) CommitData(options internal.CommitDataOptions) error {
++	// Resolve old ETag from remote blob BEFORE commit overwrites it
++	var oldETag string
++	if dc.client != nil {
++		oldAttr, err := dc.NextComponent().GetAttr(internal.GetAttrOptions{Name: options.Name})
++		if err == nil && oldAttr != nil {
++			oldETag = oldAttr.ETag
++		}
++		log.Debug("DistCache::CommitData : %s oldETag=%q (err=%v)", options.Name, oldETag, err)
++		// If GetAttr returns error (e.g., 404 for new file), oldETag stays empty
++	}
++
++	// Forward to azstorage first — commit is the source-of-truth operation
++	err := dc.NextComponent().CommitData(options)
++	if err != nil {
++		return err
++	}
++
++	if dc.client == nil {
++		return nil
++	}
++
++	// Get new ETag from the commit response
++	var newETag string
++	if options.NewETag != nil {
++		newETag = *options.NewETag
++	}
++	log.Debug("DistCache::CommitData : %s commit succeeded, oldETag=%q newETag=%q", options.Name, oldETag, newETag)
++
++	// Cancel any in-flight flush from a previous commit. This prevents a racing
++	// goroutine from uploading stale chunks after our DeleteGroup below.
++	dc.cancelFlush(options.Name)
++
++	// Cancel any in-flight read-path uploads that may overwrite our fresh data
++	dc.cancelReadUploads(options.Name)
++
++	dc.markDirty(options.Name)
++
++	// Delete old version chunks if we had a previous ETag
++	if oldETag != "" {
++		oldGID := fileGroupID(options.Name, oldETag)
++		log.Debug("DistCache::CommitData : deleting old group %q for %s", string(oldGID), options.Name)
++		if err := dc.client.DeleteGroup(context.Background(), oldGID); err != nil {
++			log.Warn("DistCache::CommitData : L2 invalidation failed for %s: %v", options.Name, err)
++		}
++	} else {
++		log.Debug("DistCache::CommitData : %s no old ETag (new file), skipping DeleteGroup", options.Name)
++	}
++
++	// Drain pending chunks and flush to L2 asynchronously now that the
++	// file is committed in Azure and safe for other nodes to read.
++	dc.pendingMu.Lock()
++	pf := dc.pendingWrites[options.Name]
++	delete(dc.pendingWrites, options.Name)
++	dc.pendingMu.Unlock()
++
++	if pf != nil && len(pf.chunks) > 0 {
++		log.Debug("DistCache::CommitData : flushing %d pending chunks to L2 for %s with newETag=%q", len(pf.chunks), options.Name, newETag)
++		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++		dc.flushMu.Lock()
++		dc.flushCancel[options.Name] = cancel
++		dc.flushMu.Unlock()
++		go func() {
++			defer cancel() // release timer resources on the success path
++			dc.flushPendingToL2(ctx, options.Name, pf.chunks, newETag)
++		}()
++	}
++	return nil
++}
++
++// --- Invalidation ---
++
++func (dc *DistCache) DeleteFile(options internal.DeleteFileOptions) error {
++	if dc.client != nil {
++		// Cancel any in-flight flush/populate goroutine so it cannot re-upload
++		// chunks under the group ID we are about to delete.
++		dc.cancelFlush(options.Name)
++		dc.cancelReadUploads(options.Name)
++		dc.markDirty(options.Name)
++		dc.clearPending(options.Name)
++		etag := dc.resolveRemoteETag(options.Name)
++		log.Debug("DistCache::DeleteFile : %s resolvedETag=%q", options.Name, etag)
++		if etag != "" {
++			gid := fileGroupID(options.Name, etag)
++			log.Debug("DistCache::DeleteFile : deleting group %q for %s", string(gid), options.Name)
++			if err := dc.client.DeleteGroup(context.Background(), gid); err != nil {
++				log.Warn("DistCache::DeleteFile : cache invalidation failed for %s: %v", options.Name, err)
++			}
++		}
++	}
++	return dc.NextComponent().DeleteFile(options)
++}
++
++func (dc *DistCache) RenameFile(options internal.RenameFileOptions) error {
++	if dc.client != nil {
++		// Cancel any in-flight flush/populate goroutine so it cannot re-upload
++		// chunks under the group ID we are about to delete.
++		dc.cancelFlush(options.Src)
++		dc.cancelReadUploads(options.Src)
++		dc.markDirty(options.Src)
++		dc.clearPending(options.Src)
++		etag := dc.resolveRemoteETag(options.Src)
++		log.Debug("DistCache::RenameFile : %s -> %s resolvedETag=%q", options.Src, options.Dst, etag)
++		if etag != "" {
++			gid := fileGroupID(options.Src, etag)
++			log.Debug("DistCache::RenameFile : deleting group %q for %s", string(gid), options.Src)
++			if err := dc.client.DeleteGroup(context.Background(), gid); err != nil {
++				log.Warn("DistCache::RenameFile : cache invalidation failed for %s: %v", options.Src, err)
++			}
++		}
++	}
++	return dc.NextComponent().RenameFile(options)
++}
++
++func (dc *DistCache) TruncateFile(options internal.TruncateFileOptions) error {
++	if dc.client != nil {
++		// Cancel any in-flight flush/populate goroutine so it cannot re-upload
++		// chunks under the group ID we are about to delete.
++		dc.cancelFlush(options.Name)
++		dc.cancelReadUploads(options.Name)
++		dc.markDirty(options.Name)
++		dc.clearPending(options.Name)
++		etag := dc.resolveRemoteETag(options.Name)
++		log.Debug("DistCache::TruncateFile : %s resolvedETag=%q", options.Name, etag)
++		if etag != "" {
++			gid := fileGroupID(options.Name, etag)
++			log.Debug("DistCache::TruncateFile : deleting group %q for %s", string(gid), options.Name)
++			if err := dc.client.DeleteGroup(context.Background(), gid); err != nil {
++				log.Warn("DistCache::TruncateFile : cache invalidation failed for %s: %v", options.Name, err)
++			}
++		}
++	}
++	return dc.NextComponent().TruncateFile(options)
++}
++
+ // --- Internal helpers ---
+ 
+ // pollChunkIntoBuffer waits for a single chunk to become available in the
+@@ -397,6 +662,35 @@ func (dc *DistCache) pollChunkIntoBuffer(ctx context.Context, name, etag string,
+ 	return 0, fmt.Errorf("dist_cache: chunk poll timeout for %s offset=%d", name, offset)
+ }
+ 
++// markDirty records that a file was recently invalidated. Reads for this file
++// will bypass dist_cache until dirtyTTL expires or clearDirty is called.
++func (dc *DistCache) markDirty(name string) {
++	dc.dirtyMu.Lock()
++	dc.dirtyFiles[name] = time.Now()
++	dc.dirtyMu.Unlock()
++}
++
++// clearDirty removes the dirty flag for a file, allowing reads to use L2 again.
++// Called after L2 has been successfully re-populated with fresh data.
++func (dc *DistCache) clearDirty(name string) {
++	dc.dirtyMu.Lock()
++	delete(dc.dirtyFiles, name)
++	dc.dirtyMu.Unlock()
++}
++
++// isDirty returns true if the file was recently invalidated and should not be
++// read from dist_cache.
++func (dc *DistCache) isDirty(name string) bool {
++	dc.dirtyMu.Lock()
++	t, ok := dc.dirtyFiles[name]
++	if ok && time.Since(t) > dirtyTTL {
++		delete(dc.dirtyFiles, name)
++		ok = false
++	}
++	dc.dirtyMu.Unlock()
++	return ok
++}
++
+ // fileGroupID returns a versioned group ID for a file. All chunks uploaded in
+ // the same version share this ID. The etag is the Azure blob ETag for the file
+ // revision, ensuring that DeleteGroup for an old version cannot affect chunks
+@@ -405,6 +699,16 @@ func fileGroupID(name string, etag string) []byte {
+ 	return []byte(fmt.Sprintf("%s\x00v%s", name, etag))
+ }
+ 
++// resolveRemoteETag queries the remote blob for its current ETag.
++// Returns empty string if the blob doesn't exist or GetAttr fails.
++func (dc *DistCache) resolveRemoteETag(name string) string {
++	attr, err := dc.NextComponent().GetAttr(internal.GetAttrOptions{Name: name})
++	if err != nil || attr == nil {
++		return ""
++	}
++	return attr.ETag
++}
++
+ // resolveETag extracts the ETag from a ReadInBufferOptions, preferring the
+ // handle's stored value (pinned at open time by block_cache).
+ func resolveETag(options *internal.ReadInBufferOptions) string {
+@@ -456,6 +760,159 @@ func (dc *DistCache) putBuf(b []byte) {
+ 	dc.chunkPool.Put(&buf)
+ }
+ 
++// clearPending discards any buffered chunks for a file (e.g. on delete/truncate)
++// and returns their buffers to the pool.
++func (dc *DistCache) clearPending(name string) {
++	dc.pendingMu.Lock()
++	pf := dc.pendingWrites[name]
++	delete(dc.pendingWrites, name)
++	dc.pendingMu.Unlock()
++	if pf != nil {
++		for _, c := range pf.chunks {
++			dc.putBuf(c.data)
++		}
++	}
++}
++
++// cancelFlush cancels any in-flight flush goroutine for the given file.
++// Must be called before DeleteGroup to prevent a racing flush from re-uploading
++// stale data after the group has been deleted.
++func (dc *DistCache) cancelFlush(name string) {
++	dc.flushMu.Lock()
++	if cancel, ok := dc.flushCancel[name]; ok {
++		log.Debug("DistCache::cancelFlush : cancelling in-flight flush goroutine for %s (new write arrived)", name)
++		cancel()
++		delete(dc.flushCancel, name)
++	}
++	dc.flushMu.Unlock()
++}
++
++// flushPendingToL2 uploads all buffered chunks for a file to the distributed
++// cache. Called asynchronously after CommitData succeeds. The etag parameter
++// is the new ETag to use for the group ID and cache keys.
++func (dc *DistCache) flushPendingToL2(ctx context.Context, name string, chunks []pendingChunk, etag string) {
++	g, gctx := errgroup.WithContext(ctx)
++	g.SetLimit(maxPendingL2Uploads)
++
++	for i := range chunks {
++		chunk := chunks[i]
++		g.Go(func() error {
++			// Always return the pooled buffer, whether we early-cancel,
++			// succeed, or the upload fails.
++			defer dc.putBuf(chunk.data)
++
++			select {
++			case <-gctx.Done():
++				return gctx.Err()
++			default:
++			}
++
++			gid := fileGroupID(name, etag)
++			log.Debug("DistCache::flushPendingToL2 : uploading chunk %s offset=%d with group %q", name, chunk.offset, string(gid))
++			opts := []dcache.UploadOption{
++				dcache.WithIgnoreLock(true),
++				dcache.WithGroupID(gid),
++				dcache.WithMetadata(map[string][]byte{"gid": gid}),
++			}
++			if dc.conf.TTLSeconds > 0 {
++				opts = append(opts, dcache.WithTTL(dc.conf.TTLSeconds))
++			}
++
++			if err := dc.client.UploadChunk(gctx, name, etag, chunk.offset, chunk.data, opts...); err != nil {
++				log.Warn("DistCache::flushPendingToL2 : upload failed for %s offset=%d: %v", name, chunk.offset, err)
++			}
++			return nil // best-effort: don't abort other uploads on failure
++		})
++	}
++
++	_ = g.Wait()
++	log.Debug("DistCache::flushPendingToL2 : flushed %d chunks for %s", len(chunks), name)
++
++	// Only clear dirty if we weren't cancelled (a cancellation means a new
++	// commit/invalidation is in progress and will manage the dirty state).
++	if ctx.Err() == nil {
++		dc.clearDirty(name)
++	}
++
++	// Clean up the cancel entry
++	dc.flushMu.Lock()
++	delete(dc.flushCancel, name)
++	dc.flushMu.Unlock()
++}
++
++// pendingCleanupLoop periodically evicts pending entries that have exceeded
++// pendingWriteTTL. This handles abandoned writes where CommitData is never called.
++func (dc *DistCache) pendingCleanupLoop() {
++	ticker := time.NewTicker(pendingCleanupInterval)
++	defer ticker.Stop()
++
++	for {
++		select {
++		case <-dc.stopCleanup:
++			return
++		case <-ticker.C:
++			dc.evictStalePending()
++		}
++	}
++}
++
++// evictStalePending removes pending entries whose lastActivity exceeds pendingWriteTTL.
++func (dc *DistCache) evictStalePending() {
++	now := time.Now()
++	dc.pendingMu.Lock()
++	for name, pf := range dc.pendingWrites {
++		if now.Sub(pf.lastActivity) > pendingWriteTTL {
++			log.Debug("DistCache::evictStalePending : evicting %d stale chunks for %s (idle %v)",
++				len(pf.chunks), name, now.Sub(pf.lastActivity))
++			for _, c := range pf.chunks {
++				dc.putBuf(c.data)
++			}
++			delete(dc.pendingWrites, name)
++		}
++	}
++	dc.pendingMu.Unlock()
++}
++
++// readUploadEntry holds a shared context for read-path uploads on a single file.
++type readUploadEntry struct {
++	ctx    context.Context
++	cancel context.CancelFunc
++}
++
++// getReadUploadCtx returns a cancellable context for read-path uploads on the
++// given file. All uploadChunkAsync goroutines for the same file share this
++// context so they can be bulk-cancelled when a write arrives.
++func (dc *DistCache) getReadUploadCtx(name string) context.Context {
++	dc.readUploadMu.Lock()
++	defer dc.readUploadMu.Unlock()
++
++	if entry, ok := dc.readUploadCancels[name]; ok {
++		// Reuse existing context if it hasn't been cancelled
++		if entry.ctx.Err() == nil {
++			return entry.ctx
++		}
++		// Previous context was cancelled (by a write), create a fresh one
++		delete(dc.readUploadCancels, name)
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
++	dc.readUploadCancels[name] = &readUploadEntry{ctx: ctx, cancel: cancel}
++	return ctx
++}
++
++// cancelReadUploads cancels all in-flight read-path uploadChunkAsync goroutines
++// for the given file. Called from write/invalidation paths to prevent stale
++// read data from overwriting freshly committed chunks.
++func (dc *DistCache) cancelReadUploads(name string) {
++	dc.readUploadMu.Lock()
++	if entry, ok := dc.readUploadCancels[name]; ok {
++		log.Debug("DistCache::cancelReadUploads : cancelling previous uploadChunkAsync goroutines for %s (new write/invalidation arrived)", name)
++		entry.cancel()
++		delete(dc.readUploadCancels, name)
++	}
++	dc.readUploadMu.Unlock()
++}
++
+ func (dc *DistCache) uploadChunkAsync(ctx context.Context, name, etag string, offset int64, data []byte) {
+ 	defer dc.putBuf(data)
+ 
+diff --git a/component/dist_cache/dist_cache_integration_test.go b/component/dist_cache/dist_cache_integration_test.go
+index b4d46b6ca..7f96df55e 100644
+--- a/component/dist_cache/dist_cache_integration_test.go
++++ b/component/dist_cache/dist_cache_integration_test.go
+@@ -356,6 +356,7 @@ func (suite *distCacheIntegSuite) TestReadInBuffer_L2MissThenHit() {
+ 
+ 	// Delete source to prove second read is from L2
+ 	os.Remove(filepath.Join(suite.storagePath, fileName))
++	suite.distCache.clearDirty(fileName)
+ 
+ 	// Second read: should hit L2
+ 	buf2 := make([]byte, chunkSize)
+@@ -370,6 +371,59 @@ func (suite *distCacheIntegSuite) TestReadInBuffer_L2MissThenHit() {
+ 	suite.assert.Equal(testData, buf2[:n2], "second read should serve from L2 cache")
+ }
+ 
++// --- Test: StageData + CommitData (block_cache write path) populates L2 ---
++
++func (suite *distCacheIntegSuite) TestStageCommit_PopulatesL2() {
++	fileName := "test_stage_commit.bin"
++	chunkSize := 1 * 1024 * 1024
++
++	// Create an existing file (so GetAttr works for ETag resolution)
++	err := os.WriteFile(filepath.Join(suite.storagePath, fileName), []byte("old"), 0644)
++	suite.assert.NoError(err)
++
++	// Stage two 1MB blocks
++	block0 := make([]byte, chunkSize)
++	rand.Read(block0)
++	block1 := make([]byte, chunkSize)
++	rand.Read(block1)
++
++	err = suite.distCache.StageData(internal.StageDataOptions{
++		Name:   fileName,
++		Offset: 0,
++		Data:   block0,
++		Id:     "block-0",
++	})
++	suite.assert.NoError(err)
++
++	err = suite.distCache.StageData(internal.StageDataOptions{
++		Name:   fileName,
++		Offset: uint64(chunkSize),
++		Data:   block1,
++		Id:     "block-1",
++	})
++	suite.assert.NoError(err)
++
++	// Commit
++	err = suite.distCache.CommitData(internal.CommitDataOptions{
++		Name:      fileName,
++		List:      []string{"block-0", "block-1"},
++		BlockSize: uint64(chunkSize),
++	})
++	suite.assert.NoError(err)
++
++	// Wait for async flush to L2
++	time.Sleep(300 * time.Millisecond)
++
++	// Verify data was committed to loopback
++	stored, err := os.ReadFile(filepath.Join(suite.storagePath, fileName))
++	suite.assert.NoError(err)
++	expected := append(block0, block1...)
++	suite.assert.Equal(expected, stored, "committed data should match staged blocks")
++
++	// Verify L2 was populated (blocks flushed to cache)
++	suite.assert.Greater(suite.srv.chunkCount(), 0, "L2 should have chunks after commit+flush")
++}
++
+ // --- Test: ReadInBuffer graceful degradation ---
+ 
+ func (suite *distCacheIntegSuite) TestReadInBuffer_GracefulDegradation() {
+@@ -619,6 +673,7 @@ func (suite *blockCacheDistCacheSuite) TestRead_L2Hit() {
+ 
+ 	// Delete the source to prove second read comes from L2
+ 	os.Remove(filepath.Join(suite.storagePath, fileName))
++	suite.distCache.clearDirty(fileName)
+ 
+ 	// Second read: L2 hit — but block_cache needs GetAttr, which requires loopback.
+ 	// Recreate a dummy file with the same size so GetAttr succeeds.
+@@ -709,6 +764,61 @@ func (suite *blockCacheDistCacheSuite) TestRead_MultiBlock_Sequential() {
+ 	suite.assert.GreaterOrEqual(suite.srv.chunkCount(), 4, "should have at least 4 chunks for 3.5 MB file")
+ }
+ 
++// --- Test: Delete through pipeline ---
++
++func (suite *blockCacheDistCacheSuite) TestDeleteFile_ThroughPipeline() {
++	fileName := "bc_delete.bin"
++	testData := make([]byte, 1*1024*1024)
++	rand.Read(testData)
++
++	err := os.WriteFile(filepath.Join(suite.storagePath, fileName), testData, 0644)
++	suite.assert.NoError(err)
++
++	// Read to populate L2
++	h, err := suite.blockCache.OpenFile(internal.OpenFileOptions{Name: fileName})
++	require.NoError(suite.T(), err)
++	buf := make([]byte, len(testData))
++	_, err = suite.blockCache.ReadInBuffer(&internal.ReadInBufferOptions{Handle: h, Offset: 0, Data: buf})
++	suite.assert.True(err == nil || err == io.EOF, "expected nil or EOF, got: %v", err)
++	err = suite.blockCache.ReleaseFile(internal.ReleaseFileOptions{Handle: h})
++	suite.assert.NoError(err)
++	time.Sleep(200 * time.Millisecond)
++
++	suite.assert.Greater(suite.srv.chunkCount(), 0)
++
++	// Delete through pipeline
++	err = suite.blockCache.DeleteFile(internal.DeleteFileOptions{Name: fileName})
++	suite.assert.NoError(err)
++
++	// Verify file is deleted from loopback
++	_, err = os.Stat(filepath.Join(suite.storagePath, fileName))
++	suite.assert.True(os.IsNotExist(err), "file should be deleted from storage")
++}
++
++// --- Test: Rename through pipeline ---
++
++func (suite *blockCacheDistCacheSuite) TestRenameFile_ThroughPipeline() {
++	oldName := "bc_rename_old.bin"
++	newName := "bc_rename_new.bin"
++	testData := make([]byte, 1*1024*1024)
++	rand.Read(testData)
++
++	err := os.WriteFile(filepath.Join(suite.storagePath, oldName), testData, 0644)
++	suite.assert.NoError(err)
++
++	// Rename through block_cache → dist_cache → loopback
++	err = suite.blockCache.RenameFile(internal.RenameFileOptions{Src: oldName, Dst: newName})
++	suite.assert.NoError(err)
++
++	// Verify old file is gone, new file exists with same data
++	_, err = os.Stat(filepath.Join(suite.storagePath, oldName))
++	suite.assert.True(os.IsNotExist(err))
++
++	stored, err := os.ReadFile(filepath.Join(suite.storagePath, newName))
++	suite.assert.NoError(err)
++	suite.assert.Equal(testData, stored, "renamed file should have same data")
++}
++
+ // --- Test: Graceful degradation (cache server down, reads still work) ---
+ 
+ func (suite *blockCacheDistCacheSuite) TestGracefulDegradation_ServerDown() {
+@@ -737,3 +847,127 @@ func (suite *blockCacheDistCacheSuite) TestGracefulDegradation_ServerDown() {
+ 	err = suite.blockCache.ReleaseFile(internal.ReleaseFileOptions{Handle: h})
+ 	suite.assert.NoError(err)
+ }
++
++// --- Test: Write (CreateFile + WriteFile + FlushFile) stages and commits through dist_cache ---
++
++func (suite *blockCacheDistCacheSuite) TestWrite_CreateFlush_PopulatesL2() {
++	fileName := "bc_write_flush.bin"
++	chunkSize := 1 * 1024 * 1024
++	testData := make([]byte, chunkSize)
++	rand.Read(testData)
++
++	// Create file through block_cache → dist_cache → loopback
++	handle, err := suite.blockCache.CreateFile(internal.CreateFileOptions{Name: fileName, Mode: 0644})
++	require.NoError(suite.T(), err)
++
++	// Write data through block_cache
++	n, err := suite.blockCache.WriteFile(&internal.WriteFileOptions{
++		Handle: handle, Offset: 0, Data: testData,
++	})
++	suite.assert.NoError(err)
++	suite.assert.Equal(chunkSize, n)
++
++	// Flush → block_cache calls StageData + CommitData on dist_cache → loopback
++	err = suite.blockCache.FlushFile(internal.FlushFileOptions{Handle: handle})
++	suite.assert.NoError(err)
++
++	err = suite.blockCache.ReleaseFile(internal.ReleaseFileOptions{Handle: handle})
++	suite.assert.NoError(err)
++
++	// Wait for async L2 population
++	time.Sleep(300 * time.Millisecond)
++
++	// Verify data was committed to loopback storage
++	stored, err := os.ReadFile(filepath.Join(suite.storagePath, fileName))
++	suite.assert.NoError(err)
++	suite.assert.Equal(testData, stored, "write should propagate through block_cache → dist_cache → loopback")
++
++	// Verify L2 was populated (StageData/CommitData triggers L2 flush in dist_cache)
++	suite.assert.Greater(suite.srv.chunkCount(), 0, "L2 should have chunks after block_cache write+flush")
++}
++
++// --- Test: Multi-block write through block_cache pipeline populates multiple L2 chunks ---
++
++func (suite *blockCacheDistCacheSuite) TestWrite_MultiBlock_PopulatesL2() {
++	fileName := "bc_write_multi.bin"
++	chunkSize := 1 * 1024 * 1024
++	// 3 full blocks
++	fileSize := 3 * chunkSize
++	testData := make([]byte, fileSize)
++	rand.Read(testData)
++
++	// Create and write through block_cache
++	handle, err := suite.blockCache.CreateFile(internal.CreateFileOptions{Name: fileName, Mode: 0644})
++	require.NoError(suite.T(), err)
++
++	n, err := suite.blockCache.WriteFile(&internal.WriteFileOptions{
++		Handle: handle, Offset: 0, Data: testData,
++	})
++	suite.assert.NoError(err)
++	suite.assert.Equal(fileSize, n)
++
++	// Flush stages all blocks then commits
++	err = suite.blockCache.FlushFile(internal.FlushFileOptions{Handle: handle})
++	suite.assert.NoError(err)
++
++	err = suite.blockCache.ReleaseFile(internal.ReleaseFileOptions{Handle: handle})
++	suite.assert.NoError(err)
++
++	// Wait for async L2 population
++	time.Sleep(300 * time.Millisecond)
++
++	// Verify full data reached loopback
++	stored, err := os.ReadFile(filepath.Join(suite.storagePath, fileName))
++	suite.assert.NoError(err)
++	suite.assert.Equal(testData, stored, "multi-block write should propagate to loopback")
++
++	// Verify multiple chunks in L2 (one per block)
++	suite.assert.GreaterOrEqual(suite.srv.chunkCount(), 3, "should have at least 3 chunks for 3 MB file with 1 MB blocks")
++}
++
++// --- Test: Write then read-back through block_cache pipeline ---
++
++func (suite *blockCacheDistCacheSuite) TestWrite_ThenRead_RoundTrip() {
++	fileName := "bc_write_read.bin"
++	chunkSize := 1 * 1024 * 1024
++	testData := make([]byte, chunkSize)
++	rand.Read(testData)
++
++	// Write through block_cache
++	handle, err := suite.blockCache.CreateFile(internal.CreateFileOptions{Name: fileName, Mode: 0644})
++	require.NoError(suite.T(), err)
++
++	_, err = suite.blockCache.WriteFile(&internal.WriteFileOptions{
++		Handle: handle, Offset: 0, Data: testData,
++	})
++	suite.assert.NoError(err)
++
++	err = suite.blockCache.FlushFile(internal.FlushFileOptions{Handle: handle})
++	suite.assert.NoError(err)
++
++	err = suite.blockCache.ReleaseFile(internal.ReleaseFileOptions{Handle: handle})
++	suite.assert.NoError(err)
++
++	// Wait for L2 population
++	time.Sleep(300 * time.Millisecond)
++	suite.assert.Greater(suite.srv.chunkCount(), 0)
++
++	// Clear dirty so L2 is used on read
++	suite.distCache.clearDirty(fileName)
++
++	// Read back through block_cache → dist_cache (L2 hit) → loopback
++	h, err := suite.blockCache.OpenFile(internal.OpenFileOptions{Name: fileName})
++	require.NoError(suite.T(), err)
++	suite.assert.Equal(int64(chunkSize), h.Size)
++
++	buf := make([]byte, chunkSize)
++	nRead, err := suite.blockCache.ReadInBuffer(&internal.ReadInBufferOptions{
++		Handle: h, Offset: 0, Data: buf,
++	})
++	suite.assert.True(err == nil || err == io.EOF, "expected nil or EOF, got: %v", err)
++	suite.assert.Equal(chunkSize, nRead)
++	suite.assert.Equal(testData, buf[:nRead], "data should survive write → flush → read round-trip through block_cache pipeline")
++
++	err = suite.blockCache.ReleaseFile(internal.ReleaseFileOptions{Handle: h})
++	suite.assert.NoError(err)
++}
+diff --git a/component/dist_cache/dist_cache_test.go b/component/dist_cache/dist_cache_test.go
+index a3430ec43..fd7bc3972 100644
+--- a/component/dist_cache/dist_cache_test.go
++++ b/component/dist_cache/dist_cache_test.go
+@@ -9,7 +9,9 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"strings"
++	"sync/atomic"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/Azure/azure-storage-fuse/v2/common/config"
+ 	"github.com/Azure/azure-storage-fuse/v2/internal"
+@@ -21,14 +23,20 @@ import (
+ // mockDCacheClient implements dcacheClient for testing.
+ type mockDCacheClient struct {
+ 	store             map[string][]byte
++	groups            map[string]map[string]bool // groupID -> set of store keys
++	chunkGroupIDs     map[string]string          // storeKey -> groupID (for GetChunkGroupID)
+ 	chunkFn           func(ctx context.Context, filename string, offset int64, buf []byte, opts ...dcache.DownloadOption) (int, error)
+ 	uploadChunkFn     func(ctx context.Context, filename string, offset int64, data []byte) error
+ 	uploadChunkCalled int
++	deleteGroupCalled int
++	lastDeletedGroup  string
+ }
+ 
+ func newMockDCacheClient() *mockDCacheClient {
+ 	return &mockDCacheClient{
+-		store: make(map[string][]byte),
++		store:         make(map[string][]byte),
++		groups:        make(map[string]map[string]bool),
++		chunkGroupIDs: make(map[string]string),
+ 	}
+ }
+ 
+@@ -55,6 +63,56 @@ func (m *mockDCacheClient) UploadChunk(ctx context.Context, filename, etag strin
+ 	return nil
+ }
+ 
++func (m *mockDCacheClient) Delete(_ context.Context, filename string, _ int64) error {
++	delete(m.store, filename)
++	return nil
++}
++
++func (m *mockDCacheClient) DeleteGroup(_ context.Context, groupID []byte) error {
++	m.deleteGroupCalled++
++	m.lastDeletedGroup = string(groupID)
++	// The versioned group ID has format "filename\x00vN". Extract the filename
++	// prefix and remove all store entries that belong to that file.
++	gid := string(groupID)
++	fileName := gid
++	if idx := strings.IndexByte(gid, '\x00'); idx >= 0 {
++		fileName = gid[:idx]
++	}
++	// Track which keys belong to which group. Remove entries registered under
++	// this exact group ID.
++	if keys, ok := m.groups[gid]; ok {
++		for k := range keys {
++			delete(m.store, k)
++		}
++		delete(m.groups, gid)
++	} else {
++		// Fallback: remove entries whose key starts with the filename
++		for k := range m.store {
++			if k == fileName || (len(k) > len(fileName) && k[:len(fileName)] == fileName && (k[len(fileName)] == ':' || k[len(fileName)] == '\x00')) {
++				delete(m.store, k)
++			}
++		}
++	}
++	return nil
++}
++
++func (m *mockDCacheClient) GetChunkGroupID(_ context.Context, filename, etag string) ([]byte, error) {
++	// Check if a group ID was recorded for chunk 0 of this file
++	key := fmt.Sprintf("%s:0", filename)
++	if gid, ok := m.chunkGroupIDs[key]; ok {
++		return []byte(gid), nil
++	}
++	return nil, dcache.ErrNotFound
++}
++
++func (m *mockDCacheClient) GetAttr(_ context.Context, _ string) (*dcache.FileAttr, error) {
++	return nil, dcache.ErrNotFound
++}
++
++func (m *mockDCacheClient) PutAttr(_ context.Context, _ []dcache.FileAttrEntry) error {
++	return nil
++}
++
+ func (m *mockDCacheClient) Close() error {
+ 	return nil
+ }
+@@ -63,6 +121,11 @@ func (m *mockDCacheClient) Close() error {
+ type mockNextComponent struct {
+ 	internal.BaseComponent
+ 	readInBufferCalled int
++	stageDataCalled    int
++	commitDataCalled   int
++	deleteFileCalled   int
++	renameFileCalled   int
++	truncateFileCalled int
+ 
+ 	readInBufferData []byte // data returned by ReadInBuffer
+ 	readInBufferFn   func(options *internal.ReadInBufferOptions) (int, error)
+@@ -88,11 +151,41 @@ func (m *mockNextComponent) ReadInBuffer(options *internal.ReadInBufferOptions)
+ 	return 0, nil
+ }
+ 
++func (m *mockNextComponent) StageData(_ internal.StageDataOptions) error {
++	m.stageDataCalled++
++	return nil
++}
++
++func (m *mockNextComponent) CommitData(_ internal.CommitDataOptions) error {
++	m.commitDataCalled++
++	return nil
++}
++
++func (m *mockNextComponent) DeleteFile(_ internal.DeleteFileOptions) error {
++	m.deleteFileCalled++
++	return nil
++}
++
++func (m *mockNextComponent) RenameFile(_ internal.RenameFileOptions) error {
++	m.renameFileCalled++
++	return nil
++}
++
++func (m *mockNextComponent) TruncateFile(_ internal.TruncateFileOptions) error {
++	m.truncateFileCalled++
++	return nil
++}
++
+ func newTestDistCache(mock *mockDCacheClient, next *mockNextComponent) *DistCache {
+ 	dc := &DistCache{
+-		client:        mock,
+-		chunkSize:     16 * 1024 * 1024,
+-		bypassOnError: true,
++		client:            mock,
++		chunkSize:         16 * 1024 * 1024,
++		bypassOnError:     true,
++		dirtyFiles:        make(map[string]time.Time),
++		pendingWrites:     make(map[string]*pendingFile),
++		flushCancel:       make(map[string]context.CancelFunc),
++		readUploadCancels: make(map[string]*readUploadEntry),
++		stopCleanup:       make(chan struct{}),
+ 	}
+ 	dc.SetName(compName)
+ 	dc.SetNextComponent(next)
+@@ -247,11 +340,562 @@ func TestReadInBuffer_AlreadyLocked_PollTimeout_FallsThrough(t *testing.T) {
+ 	assert.Equal(t, 1, next.readInBufferCalled, "should fall through to Azure after poll timeout")
+ }
+ 
++func TestStageData_WriteThrough(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	err := dc.StageData(internal.StageDataOptions{
++		Name:   "test/file.bin",
++		Offset: 0,
++		Data:   []byte("block data"),
++		Id:     "block-0",
++	})
++
++	assert.NoError(t, err)
++	assert.Equal(t, 1, next.stageDataCalled, "should forward to azstorage")
++}
++
++func TestStageData_BuffersPendingChunks(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	// Stage two chunks for the same file
++	err := dc.StageData(internal.StageDataOptions{
++		Name:   "test/file.bin",
++		Offset: 0,
++		Data:   []byte("chunk-0-data"),
++		Id:     "block-0",
++	})
++	assert.NoError(t, err)
++
++	err = dc.StageData(internal.StageDataOptions{
++		Name:   "test/file.bin",
++		Offset: 1024,
++		Data:   []byte("chunk-1-data"),
++		Id:     "block-1",
++	})
++	assert.NoError(t, err)
++
++	// Verify chunks are buffered in pendingWrites
++	dc.pendingMu.Lock()
++	pf := dc.pendingWrites["test/file.bin"]
++	dc.pendingMu.Unlock()
++
++	require.NotNil(t, pf, "should have a pendingFile entry")
++	assert.Equal(t, 2, len(pf.chunks), "should buffer both chunks")
++	assert.Equal(t, int64(0), pf.chunks[0].offset)
++	assert.Equal(t, []byte("chunk-0-data"), pf.chunks[0].data)
++	assert.Equal(t, int64(1024), pf.chunks[1].offset)
++	assert.Equal(t, []byte("chunk-1-data"), pf.chunks[1].data)
++	assert.Equal(t, int64(24), pf.totalSize, "totalSize should track cumulative data")
++
++	// Verify no L2 upload happened yet
++	assert.Equal(t, 0, mock.uploadChunkCalled, "should not upload to L2 during stage")
++}
++
++func TestStageData_SizeCapEvictsPending(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++	dc.conf.MaxFileSizeMB = 1 // 1MB cap
++
++	// Pre-populate L2 with old chunks (simulating previously cached data)
++	mock.store["test/big.bin:0"] = make([]byte, 512*1024)
++	mock.store["test/big.bin:524288"] = make([]byte, 512*1024)
++
++	// Stage a chunk that's under the cap
++	chunk := make([]byte, 512*1024) // 512KB
++	err := dc.StageData(internal.StageDataOptions{
++		Name: "test/big.bin", Offset: 0, Data: chunk, Id: "b0",
++	})
++	assert.NoError(t, err)
++
++	dc.pendingMu.Lock()
++	assert.NotNil(t, dc.pendingWrites["test/big.bin"], "should buffer chunk under cap")
++	dc.pendingMu.Unlock()
++
++	// Stage another chunk that pushes it over the 1MB cap
++	chunk2 := make([]byte, 512*1024+1) // 512KB + 1 byte, total exceeds 1MB
++	err = dc.StageData(internal.StageDataOptions{
++		Name: "test/big.bin", Offset: 512 * 1024, Data: chunk2, Id: "b1",
++	})
++	assert.NoError(t, err)
++
++	// Pending should be evicted (over cap)
++	dc.pendingMu.Lock()
++	_, exists := dc.pendingWrites["test/big.bin"]
++	dc.pendingMu.Unlock()
++	assert.False(t, exists, "should evict pending when size cap exceeded")
++
++	// L2 should NOT be invalidated — the committed state hasn't changed,
++	// so existing L2 data is still valid. CommitData handles invalidation.
++	assert.Equal(t, 0, mock.deleteGroupCalled, "should not invalidate L2 on size cap (committed state unchanged)")
++	_, exists = mock.store["test/big.bin:0"]
++	assert.True(t, exists, "L2 chunk should remain (still valid)")
++	_, exists = mock.store["test/big.bin:524288"]
++	assert.True(t, exists, "L2 chunk should remain (still valid)")
++}
++
++func TestEvictStalePending(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	// Manually insert a stale pending entry
++	dc.pendingMu.Lock()
++	dc.pendingWrites["stale/file.bin"] = &pendingFile{
++		chunks:       []pendingChunk{{offset: 0, data: []byte("old")}},
++		totalSize:    3,
++		lastActivity: time.Now().Add(-10 * time.Minute), // well past TTL
++	}
++	dc.pendingWrites["fresh/file.bin"] = &pendingFile{
++		chunks:       []pendingChunk{{offset: 0, data: []byte("new")}},
++		totalSize:    3,
++		lastActivity: time.Now(), // fresh
++	}
++	dc.pendingMu.Unlock()
++
++	// Run eviction
++	dc.evictStalePending()
++
++	dc.pendingMu.Lock()
++	_, staleExists := dc.pendingWrites["stale/file.bin"]
++	_, freshExists := dc.pendingWrites["fresh/file.bin"]
++	dc.pendingMu.Unlock()
++
++	assert.False(t, staleExists, "stale entry should be evicted")
++	assert.True(t, freshExists, "fresh entry should remain")
++}
++
++func TestCommitData_ForwardOnly(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{getAttrETag: "existingetag"}
++	dc := newTestDistCache(mock, next)
++
++	err := dc.CommitData(internal.CommitDataOptions{
++		Name: "test/file.bin",
++		List: []string{"block-0", "block-1"},
++	})
++
++	assert.NoError(t, err)
++	assert.Equal(t, 1, next.commitDataCalled)
++	// CommitData should always invalidate old L2 entries
++	assert.Equal(t, 1, mock.deleteGroupCalled)
++	assert.Equal(t, "test/file.bin\x00vexistingetag", mock.lastDeletedGroup)
++}
++
++func TestCommitData_FlushesPendingToL2(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{getAttrETag: "oldetag"}
++	dc := newTestDistCache(mock, next)
++
++	// Pre-populate L2 with old chunks (simulating a previously cached file)
++	mock.store["test/file.bin:0"] = []byte("old-chunk-0")
++	mock.store["test/file.bin:4096"] = []byte("old-chunk-1")
++	mock.store["test/file.bin:8192"] = []byte("old-chunk-2")
++
++	// Stage chunks first
++	_ = dc.StageData(internal.StageDataOptions{
++		Name: "test/file.bin", Offset: 0, Data: []byte("chunk-0"), Id: "b0",
++	})
++	_ = dc.StageData(internal.StageDataOptions{
++		Name: "test/file.bin", Offset: 4096, Data: []byte("chunk-1"), Id: "b1",
++	})
++
++	// Verify chunks are pending
++	dc.pendingMu.Lock()
++	pf := dc.pendingWrites["test/file.bin"]
++	require.NotNil(t, pf)
++	assert.Equal(t, 2, len(pf.chunks))
++	dc.pendingMu.Unlock()
++
++	// Commit
++	err := dc.CommitData(internal.CommitDataOptions{
++		Name: "test/file.bin",
++		List: []string{"b0", "b1"},
++	})
++	assert.NoError(t, err)
++
++	// pendingWrites should be drained immediately
++	dc.pendingMu.Lock()
++	_, exists := dc.pendingWrites["test/file.bin"]
++	dc.pendingMu.Unlock()
++	assert.False(t, exists, "pending chunks should be drained after commit")
++
++	// DeleteGroup should have been called to invalidate old L2 data
++	assert.Equal(t, 1, mock.deleteGroupCalled, "should invalidate old L2 before flushing new data")
++	assert.Equal(t, "test/file.bin\x00voldetag", mock.lastDeletedGroup)
++
++	// Old chunk beyond new file extent should be gone
++	_, exists = mock.store["test/file.bin:8192"]
++	assert.False(t, exists, "old L2 chunk beyond new extent should be deleted")
++
++	// Wait briefly for the async flush goroutine to complete
++	time.Sleep(100 * time.Millisecond)
++
++	// Verify new chunks were uploaded to L2 (after DeleteGroup cleared old ones)
++	assert.Equal(t, 2, mock.uploadChunkCalled, "should flush both chunks to L2")
++	assert.Equal(t, []byte("chunk-0"), mock.store["test/file.bin:0"])
++	assert.Equal(t, []byte("chunk-1"), mock.store["test/file.bin:4096"])
++}
++
++func TestCommitData_CancelsPreviousFlush(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	// Gate that blocks UploadChunk until we release it or the context is cancelled
++	gate := make(chan struct{})
++	var cancelledChunks int32
++	var uploadedChunks int32
++
++	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
++		select {
++		case <-ctx.Done():
++			atomic.AddInt32(&cancelledChunks, 1)
++			return ctx.Err()
++		case <-gate:
++			atomic.AddInt32(&uploadedChunks, 1)
++			key := fmt.Sprintf("%s:%d", filename, offset)
++			mock.store[key] = append([]byte(nil), data...)
++			return nil
++		}
++	}
++
++	// Stage chunks for commit #1 (large file)
++	for i := 0; i < 4; i++ {
++		_ = dc.StageData(internal.StageDataOptions{
++			Name: "test/file.bin", Offset: uint64(i * 4096), Data: []byte(fmt.Sprintf("old-chunk-%d", i)), Id: fmt.Sprintf("b%d", i),
++		})
++	}
++
++	// Commit #1: starts an async flush that will block on the gate
++	err := dc.CommitData(internal.CommitDataOptions{
++		Name: "test/file.bin",
++		List: []string{"b0", "b1", "b2", "b3"},
++	})
++	assert.NoError(t, err)
++
++	// Give the flush goroutine time to start and block
++	time.Sleep(50 * time.Millisecond)
++
++	// Stage chunks for commit #2 (smaller file rewrite via O_TRUNC)
++	_ = dc.StageData(internal.StageDataOptions{
++		Name: "test/file.bin", Offset: 0, Data: []byte("new-chunk-0"), Id: "c0",
++	})
++
++	// Commit #2: should cancel flush #1 before doing DeleteGroup + its own flush
++	err = dc.CommitData(internal.CommitDataOptions{
++		Name: "test/file.bin",
++		List: []string{"c0"},
++	})
++	assert.NoError(t, err)
++
++	// Now unblock the gate so flush #2 can proceed
++	close(gate)
++
++	// Wait for flush #2 to complete
++	time.Sleep(100 * time.Millisecond)
++
++	// Flush #1's chunks should have been cancelled (not uploaded)
++	assert.True(t, atomic.LoadInt32(&cancelledChunks) > 0, "flush #1 should have been cancelled")
++
++	// Flush #2's new chunk should have been uploaded
++	assert.Equal(t, []byte("new-chunk-0"), mock.store["test/file.bin:0"])
++
++	// Old chunks from flush #1 should NOT be in L2
++	_, exists := mock.store["test/file.bin:4096"]
++	assert.False(t, exists, "old chunk from cancelled flush should not be in L2")
++	_, exists = mock.store["test/file.bin:8192"]
++	assert.False(t, exists, "old chunk from cancelled flush should not be in L2")
++}
++
++func TestDeleteFile_Invalidation(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{getAttrETag: "deleteetag"}
++	dc := newTestDistCache(mock, next)
++
++	mock.store["test/file.txt"] = []byte("cached data")
++
++	err := dc.DeleteFile(internal.DeleteFileOptions{Name: "test/file.txt"})
++
++	assert.NoError(t, err)
++	assert.Equal(t, 1, next.deleteFileCalled)
++	_, exists := mock.store["test/file.txt"]
++	assert.False(t, exists, "should invalidate cache entry")
++}
++
++func TestRenameFile_Invalidation(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{getAttrETag: "renameetag"}
++	dc := newTestDistCache(mock, next)
++
++	mock.store["old-name.txt"] = []byte("data")
++
++	err := dc.RenameFile(internal.RenameFileOptions{Src: "old-name.txt", Dst: "new-name.txt"})
++
++	assert.NoError(t, err)
++	assert.Equal(t, 1, next.renameFileCalled)
++	_, exists := mock.store["old-name.txt"]
++	assert.False(t, exists, "should invalidate old cache entry")
++}
++
++func TestTruncateFile_Invalidation(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	err := dc.TruncateFile(internal.TruncateFileOptions{
++		Name:    "test/file.txt",
++		OldSize: 1024,
++		NewSize: 512,
++	})
++
++	assert.NoError(t, err)
++	assert.Equal(t, 1, next.truncateFileCalled)
++}
++
++func TestReadInBuffer_BypassesDirtyFile(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{readInBufferData: []byte("fresh-data")}
++	dc := newTestDistCache(mock, next)
++
++	// Populate cache with stale data
++	mock.store["test/file.txt:0"] = []byte("stale-data")
++
++	// Truncate marks the file as dirty
++	err := dc.TruncateFile(internal.TruncateFileOptions{
++		Name:    "test/file.txt",
++		OldSize: 1024,
++		NewSize: 512,
++	})
++	require.NoError(t, err)
++
++	// Read should bypass dist_cache and go to azstorage
++	buf := make([]byte, 64)
++	n, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
++		Path:   "test/file.txt",
++		Offset: 0,
++		Data:   buf,
++	})
++	assert.NoError(t, err)
++	assert.Equal(t, len("fresh-data"), n)
++	assert.Equal(t, "fresh-data", string(buf[:n]))
++	assert.Equal(t, 1, next.readInBufferCalled, "should bypass dist_cache for dirty file")
++}
++
+ func TestPriority(t *testing.T) {
+-	dc := &DistCache{}
++	dc := &DistCache{dirtyFiles: make(map[string]time.Time)}
+ 	assert.Equal(t, internal.EComponentPriority.LevelMid(), dc.Priority())
+ }
+ 
++func TestCommitData_DeletesOldETagGroup(t *testing.T) {
++	// Simulate: a file exists with ETag-A in Azure. A new commit produces ETag-B.
++	// CommitData should GetAttr to find ETag-A, commit, then DeleteGroup(ETag-A).
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{getAttrETag: "0x8DC3A2B1C4E5F6A7"}
++	dc := newTestDistCache(mock, next)
++
++	// Simulate pre-existing chunks cached under old ETag
++	oldGroupID := "test/file.bin\x00v0x8DC3A2B1C4E5F6A7"
++	mock.store["test/file.bin:0"] = []byte("old-chunk-0")
++	mock.store["test/file.bin:4096"] = []byte("old-chunk-1")
++	mock.groups[oldGroupID] = map[string]bool{
++		"test/file.bin:0":    true,
++		"test/file.bin:4096": true,
++	}
++
++	// Stage and commit new data (simulating block_cache providing new ETag)
++	newETag := "0x8DC4B3C2D5F607B8"
++	err := dc.StageData(internal.StageDataOptions{
++		Name: "test/file.bin", Offset: 0, Data: []byte("new-data"), Id: "b0",
++	})
++	require.NoError(t, err)
++
++	err = dc.CommitData(internal.CommitDataOptions{
++		Name:    "test/file.bin",
++		List:    []string{"b0"},
++		NewETag: &newETag,
++	})
++	require.NoError(t, err)
++
++	// Should have deleted the old ETag group
++	assert.Equal(t, 1, mock.deleteGroupCalled)
++	assert.Equal(t, oldGroupID, mock.lastDeletedGroup, "should delete old ETag group")
++
++	// Old chunks should be gone
++	_, exists := mock.store["test/file.bin:0"]
++	assert.False(t, exists, "old chunk 0 should be deleted via old ETag group")
++	_, exists = mock.store["test/file.bin:4096"]
++	assert.False(t, exists, "old chunk 1 should be deleted via old ETag group")
++}
++
++func TestReadUploadCancelled_OnCommitData(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	// Gate that blocks UploadChunk until context is cancelled or released
++	uploadStarted := make(chan struct{})
++	var uploadCancelled int32
++	var startedOnce int32
++
++	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
++		// Only track the first call (from the read-path uploadChunkAsync)
++		if atomic.CompareAndSwapInt32(&startedOnce, 0, 1) {
++			close(uploadStarted)
++			<-ctx.Done()
++			atomic.AddInt32(&uploadCancelled, 1)
++			return ctx.Err()
++		}
++		// Subsequent calls (from flush) just succeed
++		key := fmt.Sprintf("%s:%d", filename, offset)
++		mock.store[key] = append([]byte(nil), data...)
++		return nil
++	}
++
++	// Simulate a read-path cache miss that triggers uploadChunkAsync
++	azData := []byte("data from azure")
++	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
++		return 0, dcache.ErrNotFoundGotLock
++	}
++	next.readInBufferData = azData
++
++	buf := make([]byte, 1024)
++	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
++		Path:   "test/file.bin",
++		Offset: 0,
++		Data:   buf,
++	})
++	require.NoError(t, err)
++
++	// Wait for the uploadChunkAsync goroutine to start and block
++	<-uploadStarted
++
++	// Now commit new data — this should cancel the in-flight read upload
++	_ = dc.StageData(internal.StageDataOptions{
++		Name: "test/file.bin", Offset: 0, Data: []byte("new-data"), Id: "b0",
++	})
++	err = dc.CommitData(internal.CommitDataOptions{
++		Name: "test/file.bin",
++		List: []string{"b0"},
++	})
++	assert.NoError(t, err)
++
++	// Wait briefly for the cancellation to propagate
++	time.Sleep(50 * time.Millisecond)
++
++	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCancelled),
++		"read-path uploadChunkAsync should be cancelled when CommitData arrives")
++}
++
++func TestReadUploadCancelled_OnDeleteFile(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	uploadStarted := make(chan struct{})
++	var uploadCancelled int32
++
++	mock.uploadChunkFn = func(ctx context.Context, _ string, _ int64, _ []byte) error {
++		close(uploadStarted)
++		<-ctx.Done()
++		atomic.AddInt32(&uploadCancelled, 1)
++		return ctx.Err()
++	}
++
++	// Trigger a read-path upload
++	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
++		return 0, dcache.ErrNotFoundGotLock
++	}
++	next.readInBufferData = []byte("file data")
++
++	buf := make([]byte, 1024)
++	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
++		Path:   "test/file.bin",
++		Offset: 0,
++		Data:   buf,
++	})
++	require.NoError(t, err)
++
++	<-uploadStarted
++
++	// Delete the file — should cancel read uploads
++	err = dc.DeleteFile(internal.DeleteFileOptions{Name: "test/file.bin"})
++	assert.NoError(t, err)
++
++	time.Sleep(50 * time.Millisecond)
++
++	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCancelled),
++		"read-path uploadChunkAsync should be cancelled when DeleteFile arrives")
++}
++
++func TestReadUploadNotCancelled_ForDifferentFile(t *testing.T) {
++	mock := newMockDCacheClient()
++	next := &mockNextComponent{}
++	dc := newTestDistCache(mock, next)
++
++	uploadStarted := make(chan struct{})
++	uploadDone := make(chan struct{})
++	var uploadCompleted int32
++	var startedOnce int32
++
++	mock.uploadChunkFn = func(ctx context.Context, filename string, offset int64, data []byte) error {
++		// Only block on the first call (from read-path uploadChunkAsync for file-a)
++		if atomic.CompareAndSwapInt32(&startedOnce, 0, 1) {
++			close(uploadStarted)
++			select {
++			case <-ctx.Done():
++				return ctx.Err()
++			case <-uploadDone:
++				key := fmt.Sprintf("%s:%d", filename, offset)
++				mock.store[key] = append([]byte(nil), data...)
++				atomic.AddInt32(&uploadCompleted, 1)
++				return nil
++			}
++		}
++		// Subsequent calls (from flush for file-b) just succeed
++		key := fmt.Sprintf("%s:%d", filename, offset)
++		mock.store[key] = append([]byte(nil), data...)
++		return nil
++	}
++
++	// Trigger read-path upload for file A
++	mock.chunkFn = func(_ context.Context, _ string, _ int64, _ []byte, _ ...dcache.DownloadOption) (int, error) {
++		return 0, dcache.ErrNotFoundGotLock
++	}
++	next.readInBufferData = []byte("file-a-data")
++
++	buf := make([]byte, 1024)
++	_, err := dc.ReadInBuffer(&internal.ReadInBufferOptions{
++		Path:   "test/file-a.bin",
++		Offset: 0,
++		Data:   buf,
++	})
++	require.NoError(t, err)
++
++	<-uploadStarted
++
++	// Write to a DIFFERENT file — should NOT cancel file-a's read upload
++	_ = dc.StageData(internal.StageDataOptions{
++		Name: "test/file-b.bin", Offset: 0, Data: []byte("data-b"), Id: "b0",
++	})
++	_ = dc.CommitData(internal.CommitDataOptions{
++		Name: "test/file-b.bin",
++		List: []string{"b0"},
++	})
++
++	// Unblock the upload for file A
++	close(uploadDone)
++	time.Sleep(50 * time.Millisecond)
++
++	assert.Equal(t, int32(1), atomic.LoadInt32(&uploadCompleted),
++		"read-path upload for file-a should NOT be cancelled by write to file-b")
++	assert.Equal(t, []byte("file-a-data"), mock.store["test/file-a.bin:0"])
++}
++
+ // --- Tests for recoverable network error handling ---
+ 
+ func TestReadInBuffer_RecoverableNetErr_BypassesToStorage(t *testing.T) {
+diff --git a/go.mod b/go.mod
+index 2d1e143b5..a9ce5be9e 100644
+--- a/go.mod
++++ b/go.mod
+@@ -22,7 +22,7 @@ require (
+ 	github.com/vibhansa-msft/blobfilter v0.0.0-20250115104552-d9d40722be3e
+ 	github.com/vibhansa-msft/tlru v0.0.0-20240410102558-9e708419e21f
+ 	go.uber.org/atomic v1.11.0
+-	golang.org/x/sync v0.21.0 // indirect
++	golang.org/x/sync v0.21.0
+ 	golang.org/x/time v0.15.0
+ 	gopkg.in/ini.v1 v1.67.3
+ 	gopkg.in/yaml.v2 v2.4.0
